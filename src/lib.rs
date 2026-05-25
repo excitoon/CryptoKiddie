@@ -463,7 +463,8 @@ pub mod token {
                 )));
             }
             Err(CliError::Message(
-                "Direct USB/CCID signing is not yet implemented. Hardware validation is required.".to_string(),
+                "Direct USB/CCID signing is not yet implemented. Hardware validation is required."
+                    .to_string(),
             ))
         }
     }
@@ -623,21 +624,24 @@ pub mod token {
             DigestAlgorithm::Sha256 => &[
                 0x30, 0x31, // SEQUENCE, 49 bytes
                 0x30, 0x0d, // SEQUENCE (AlgorithmIdentifier), 13 bytes
-                0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, // OID sha-256
+                0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02,
+                0x01, // OID sha-256
                 0x05, 0x00, // NULL
                 0x04, 0x20, // OCTET STRING, 32 bytes
             ],
             DigestAlgorithm::Sha384 => &[
                 0x30, 0x41, // SEQUENCE, 65 bytes
                 0x30, 0x0d, // SEQUENCE (AlgorithmIdentifier), 13 bytes
-                0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x02, // OID sha-384
+                0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02,
+                0x02, // OID sha-384
                 0x05, 0x00, // NULL
                 0x04, 0x30, // OCTET STRING, 48 bytes
             ],
             DigestAlgorithm::Sha512 => &[
                 0x30, 0x51, // SEQUENCE, 81 bytes
                 0x30, 0x0d, // SEQUENCE (AlgorithmIdentifier), 13 bytes
-                0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x03, // OID sha-512
+                0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02,
+                0x03, // OID sha-512
                 0x05, 0x00, // NULL
                 0x04, 0x40, // OCTET STRING, 64 bytes
             ],
@@ -1283,8 +1287,8 @@ fn usage() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        CliError, DigestAlgorithm, KeyAlgorithm, SignCommand, Transport, apdu, ccid,
-        cms_envelope, compute_digest, gost, run_cli, token,
+        CliError, DigestAlgorithm, KeyAlgorithm, SignCommand, Transport, apdu, ccid, cms_envelope,
+        compute_digest, gost, run_cli, token,
     };
     use std::{
         env,
@@ -1452,6 +1456,38 @@ mod tests {
     }
 
     #[test]
+    fn dry_run_accepts_rutoken_gost_via_generic_pkcs11_uri() {
+        let temp = TempDir::new();
+        let input = temp.write_file("document.txt", "hello");
+        let cert = temp.write_file("signer.der", "certificate");
+        let module = temp.write_file("pkcs11-module.so", "driver");
+        let output = temp.path().join("document.txt.p7s");
+
+        let output = run_cli([
+            OsString::from("sign"),
+            OsString::from("--input"),
+            input.into_os_string(),
+            OsString::from("--output"),
+            output.into_os_string(),
+            OsString::from("--cert"),
+            cert.into_os_string(),
+            OsString::from("--key-uri"),
+            OsString::from("pkcs11:token=Rutoken;id=%01"),
+            OsString::from("--digest"),
+            OsString::from("gost12-256"),
+            OsString::from("--pkcs11-module"),
+            module.into_os_string(),
+            OsString::from("--dry-run"),
+        ])
+        .expect("Rutoken/GOST dry run should use generic PKCS#11 path");
+
+        assert!(output.contains("transport=pkcs11"));
+        assert!(output.contains("key_uri=pkcs11:token=Rutoken;id=%01"));
+        assert!(output.contains("digest_algorithm=gost12-256"));
+        assert!(output.contains("key_algorithm=gost3410-2012-256"));
+    }
+
+    #[test]
     fn dry_run_sha256_ecdsa_renders_plan() {
         let temp = TempDir::new();
         let input = temp.write_file("document.txt", "hello");
@@ -1550,9 +1586,9 @@ mod tests {
         assert_eq!(
             digest,
             vec![
-                0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40, 0xde, 0x5d,
-                0xae, 0x22, 0x23, 0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c, 0xb4, 0x10,
-                0xff, 0x61, 0xf2, 0x00, 0x15, 0xad,
+                0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40, 0xde, 0x5d, 0xae,
+                0x22, 0x23, 0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61,
+                0xf2, 0x00, 0x15, 0xad,
             ]
         );
     }
@@ -1691,8 +1727,8 @@ mod tests {
         assert_eq!(
             block.to_bytes().expect("CCID block should serialize"),
             vec![
-                0x6f, 0x05, 0x00, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0x00, 0xa4, 0x04,
-                0x00, 0x00,
+                0x6f, 0x05, 0x00, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0x00, 0xa4, 0x04, 0x00,
+                0x00,
             ]
         );
     }
