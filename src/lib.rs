@@ -192,6 +192,10 @@ pub mod cms_envelope {
         }
     }
 
+    /// Diagnostic marker proving the native CMS boundary is linked.
+    ///
+    /// Full `SignedData` emission is intentionally gated until the token-backed
+    /// signature bytes can be validated against real Rutoken hardware.
     pub fn cms_crate_backend() -> &'static str {
         std::any::type_name::<cms::content_info::ContentInfo>()
     }
@@ -277,8 +281,15 @@ pub mod token {
                     digest.len()
                 )));
             }
+            let _ctx = pkcs11::Ctx::new(&self.module).map_err(|error| {
+                CliError::Message(format!(
+                    "failed to load PKCS#11 module {}: {error}",
+                    self.module.display()
+                ))
+            })?;
+
             Err(CliError::Message(format!(
-                "PKCS#11 hardware signing through {} is wired as the native boundary, but live token signing requires Rutoken mechanism validation on connected hardware",
+                "PKCS#11 signing via {} is not yet enabled. Hardware validation is required before live token operations are supported.",
                 self.module.display()
             )))
         }
@@ -299,7 +310,7 @@ pub mod token {
                 )));
             }
             Err(CliError::Message(
-                "direct USB/CCID APDU signing is scaffolded, but Rutoken-specific command APDUs still need hardware/spec validation".to_string(),
+                "Direct USB/CCID signing is not yet implemented. Rutoken-specific commands require hardware validation.".to_string(),
             ))
         }
     }
@@ -579,8 +590,7 @@ impl SignCommand {
         }?;
 
         Err(CliError::Message(
-            "CMS SignedData emission is not enabled until the hardware signature path is validated"
-                .to_string(),
+            "CMS signature generation is not yet enabled. This feature requires hardware validation and will be available in a future release.".to_string(),
         ))
     }
 
@@ -688,6 +698,7 @@ fn ensure_parent_exists(path: &Path, flag: &str) -> Result<(), CliError> {
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
+    // Keep this tiny diagnostic encoder local instead of adding another dependency.
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut output = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
