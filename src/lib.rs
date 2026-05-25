@@ -1,4 +1,5 @@
 use std::{
+    env,
     ffi::OsString,
     fmt::{self, Write as _},
     fs,
@@ -151,6 +152,16 @@ pub mod gost {
 
 pub mod cms_envelope {
     use super::{CliError, DigestAlgorithm};
+    use cms::{
+        cert::{CertificateChoices, x509::Certificate},
+        content_info::{CmsVersion, ContentInfo},
+        signed_data::{
+            CertificateSet, DigestAlgorithmIdentifiers, EncapsulatedContentInfo, SignatureValue,
+            SignedData, SignerIdentifier, SignerInfo, SignerInfos,
+        },
+    };
+    use der::{Any, AnyRef, Decode, Encode, asn1::OctetString};
+    use spki::AlgorithmIdentifierOwned;
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct CmsSigningInput {
@@ -193,17 +204,109 @@ pub mod cms_envelope {
         }
     }
 
-    /// Diagnostic marker proving the native CMS boundary is linked.
-    ///
-    /// Full `SignedData` emission is intentionally gated until the token-backed
-    /// signature bytes can be validated against real Rutoken hardware.
+    pub fn build_signed_data_der(
+        input: &CmsSigningInput,
+        document: &[u8],
+        signature: Vec<u8>,
+    ) -> Result<Vec<u8>, CliError> {
+        input.validate()?;
+        if signature.is_empty() {
+            return Err(CliError::Message("signature must not be empty".to_string()));
+        }
+
+        let certificate = Certificate::from_der(&input.signer_certificate)
+            .map_err(|error| CliError::Message(format!("failed to parse --cert DER: {error}")))?;
+        let digest_algorithm = algorithm_identifier(input.digest_algorithm.digest_oid());
+        let signature_algorithm = algorithm_identifier(input.digest_algorithm.signature_oid());
+        let econtent = if input.detached {
+            None
+        } else {
+            Some(any_from_der(
+                &OctetString::new(document)
+                    .map_err(|error| {
+                        CliError::Message(format!("failed to encode content: {error}"))
+                    })?
+                    .to_der()
+                    .map_err(|error| {
+                        CliError::Message(format!("failed to encode content: {error}"))
+                    })?,
+            )?)
+        };
+
+        let signed_data = SignedData {
+            version: CmsVersion::V1,
+            digest_algorithms: DigestAlgorithmIdentifiers::try_from(vec![digest_algorithm.clone()])
+                .map_err(|error| {
+                    CliError::Message(format!("failed to encode digest algorithms: {error}"))
+                })?,
+            encap_content_info: EncapsulatedContentInfo {
+                econtent_type: const_oid::db::rfc5911::ID_DATA,
+                econtent,
+            },
+            certificates: Some(
+                CertificateSet::try_from(vec![CertificateChoices::Certificate(
+                    certificate.clone(),
+                )])
+                .map_err(|error| {
+                    CliError::Message(format!("failed to encode certificate set: {error}"))
+                })?,
+            ),
+            crls: None,
+            signer_infos: SignerInfos::try_from(vec![SignerInfo {
+                version: CmsVersion::V1,
+                sid: SignerIdentifier::from(&certificate),
+                digest_alg: digest_algorithm,
+                signed_attrs: None,
+                signature_algorithm,
+                signature: SignatureValue::new(signature).map_err(|error| {
+                    CliError::Message(format!("failed to encode signature value: {error}"))
+                })?,
+                unsigned_attrs: None,
+            }])
+            .map_err(|error| CliError::Message(format!("failed to encode signer info: {error}")))?,
+        };
+
+        let signed_data_der = signed_data
+            .to_der()
+            .map_err(|error| CliError::Message(format!("failed to encode SignedData: {error}")))?;
+        let content_info = ContentInfo {
+            content_type: const_oid::db::rfc5911::ID_SIGNED_DATA,
+            content: any_from_der(&signed_data_der)?,
+        };
+        content_info.to_der().map_err(|error| {
+            CliError::Message(format!("failed to encode CMS ContentInfo: {error}"))
+        })
+    }
+
     pub fn cms_crate_backend() -> &'static str {
         std::any::type_name::<cms::content_info::ContentInfo>()
+    }
+
+    fn algorithm_identifier(oid: const_oid::ObjectIdentifier) -> AlgorithmIdentifierOwned {
+        AlgorithmIdentifierOwned {
+            oid,
+            parameters: None,
+        }
+    }
+
+    fn any_from_der(der: &[u8]) -> Result<Any, CliError> {
+        AnyRef::try_from(der)
+            .map(Any::from)
+            .map_err(|error| CliError::Message(format!("failed to wrap ASN.1 value: {error}")))
     }
 }
 
 pub mod token {
     use super::{CliError, DigestAlgorithm};
+    use cryptoki::{
+        context::{CInitializeArgs, CInitializeFlags, Pkcs11},
+        mechanism::{Mechanism, MechanismType, vendor_defined::VendorDefinedMechanism},
+        object::{Attribute, ObjectClass},
+        session::UserType,
+        slot::Slot,
+        types::AuthPin,
+    };
+    use cryptoki_sys::CKM_GOSTR3410;
     use std::path::{Path, PathBuf};
 
     pub const GOST3410_2012_256_MECHANISM: &str = "CKM_GOSTR3410_2012_256";
@@ -212,14 +315,16 @@ pub mod token {
     pub struct Pkcs11SignerConfig {
         pub module: PathBuf,
         pub key_uri: String,
+        pub pin: Option<String>,
         pub mechanism: &'static str,
     }
 
     impl Pkcs11SignerConfig {
-        pub fn new(module: PathBuf, key_uri: String) -> Self {
+        pub fn new(module: PathBuf, key_uri: String, pin: Option<String>) -> Self {
             Self {
                 module,
                 key_uri,
+                pin,
                 mechanism: GOST3410_2012_256_MECHANISM,
             }
         }
@@ -282,17 +387,46 @@ pub mod token {
                     digest.len()
                 )));
             }
-            let _ctx = cryptoki::context::Pkcs11::new(&self.module).map_err(|error| {
+            let selector = KeyUriSelector::parse(&self.key_uri)?;
+            let ctx = Pkcs11::new(&self.module).map_err(|error| {
                 CliError::Message(format!(
                     "failed to load PKCS#11 module {}: {error}",
                     self.module.display()
                 ))
             })?;
+            ctx.initialize(CInitializeArgs::new(CInitializeFlags::OS_LOCKING_OK))
+                .map_err(|error| {
+                    CliError::Message(format!("failed to initialize PKCS#11: {error}"))
+                })?;
+            let slot = selector.select_slot(&ctx)?;
+            let session = ctx.open_rw_session(slot).map_err(|error| {
+                CliError::Message(format!("failed to open PKCS#11 session: {error}"))
+            })?;
+            let pin = self
+                .pin
+                .as_ref()
+                .map(|pin| AuthPin::new(pin.clone().into()));
+            session
+                .login(UserType::User, pin.as_ref())
+                .map_err(|error| {
+                    CliError::Message(format!("failed to login to PKCS#11 token: {error}"))
+                })?;
+            let template = selector.private_key_template();
+            let key = session
+                .find_objects(&template)
+                .map_err(|error| {
+                    CliError::Message(format!("failed to search PKCS#11 objects: {error}"))
+                })?
+                .into_iter()
+                .next()
+                .ok_or_else(|| {
+                    CliError::Message("--key-uri did not match a token private key".to_string())
+                })?;
+            let mechanism = gost3410_mechanism();
 
-            Err(CliError::Message(format!(
-                "PKCS#11 signing via {} is not yet enabled. Hardware validation is required before live token operations are supported.",
-                self.module.display()
-            )))
+            session
+                .sign(&mechanism, key, digest)
+                .map_err(|error| CliError::Message(format!("PKCS#11 C_Sign failed: {error}")))
         }
     }
 
@@ -324,6 +458,147 @@ pub mod token {
                 "--pkcs11-module does not exist: {}",
                 path.display()
             )))
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct KeyUriSelector {
+        pub token: Option<String>,
+        pub slot: Option<u64>,
+        pub id: Option<Vec<u8>>,
+        pub object: Option<String>,
+    }
+
+    impl KeyUriSelector {
+        pub fn parse(uri: &str) -> Result<Self, CliError> {
+            let attributes = uri
+                .strip_prefix("pkcs11:")
+                .ok_or_else(|| CliError::Usage("--key-uri must start with pkcs11:".to_string()))?;
+            let mut selector = Self {
+                token: None,
+                slot: None,
+                id: None,
+                object: None,
+            };
+
+            for pair in attributes.split(';').filter(|pair| !pair.is_empty()) {
+                let Some((name, value)) = pair.split_once('=') else {
+                    return Err(CliError::Usage(format!(
+                        "invalid --key-uri attribute: {pair}"
+                    )));
+                };
+                match name {
+                    "token" => selector.token = Some(percent_decode_text(value)?),
+                    "slot" | "slot-id" => {
+                        selector.slot = Some(value.parse::<u64>().map_err(|_| {
+                            CliError::Usage(format!("invalid numeric --key-uri {name}: {value}"))
+                        })?)
+                    }
+                    "id" => selector.id = Some(percent_decode_bytes(value)?),
+                    "object" => selector.object = Some(percent_decode_text(value)?),
+                    _ => {}
+                }
+            }
+
+            if selector.id.is_none() && selector.object.is_none() {
+                return Err(CliError::Usage(
+                    "--key-uri must include id= or object= to locate the private key".to_string(),
+                ));
+            }
+            Ok(selector)
+        }
+
+        fn select_slot(&self, ctx: &Pkcs11) -> Result<Slot, CliError> {
+            if let Some(slot) = self.slot {
+                return Slot::try_from(slot)
+                    .map_err(|error| CliError::Message(format!("invalid PKCS#11 slot: {error}")));
+            }
+
+            let slots = ctx.get_slots_with_token().map_err(|error| {
+                CliError::Message(format!("failed to list PKCS#11 slots: {error}"))
+            })?;
+            if let Some(token) = &self.token {
+                for slot in slots {
+                    let info = ctx.get_token_info(slot).map_err(|error| {
+                        CliError::Message(format!("failed to read PKCS#11 token info: {error}"))
+                    })?;
+                    if info.label().trim() == token {
+                        return Ok(slot);
+                    }
+                }
+                return Err(CliError::Message(format!(
+                    "--key-uri token={token} did not match an inserted token"
+                )));
+            }
+
+            slots
+                .into_iter()
+                .next()
+                .ok_or_else(|| CliError::Message("no PKCS#11 token slots found".to_string()))
+        }
+
+        pub fn private_key_template(&self) -> Vec<Attribute> {
+            let mut template = vec![
+                Attribute::Class(ObjectClass::PRIVATE_KEY),
+                Attribute::Sign(true),
+            ];
+            if let Some(id) = &self.id {
+                template.push(Attribute::Id(id.clone()));
+            }
+            if let Some(object) = &self.object {
+                template.push(Attribute::Label(object.as_bytes().to_vec()));
+            }
+            template
+        }
+    }
+
+    fn gost3410_mechanism() -> Mechanism<'static> {
+        let mechanism_type = unsafe {
+            // CKM_GOSTR3410 is present in cryptoki-sys but not yet modelled by cryptoki's safe
+            // Mechanism enum; MechanismType is the crate's transparent newtype over CK_MECHANISM_TYPE.
+            std::mem::transmute::<cryptoki_sys::CK_MECHANISM_TYPE, MechanismType>(CKM_GOSTR3410)
+        };
+        Mechanism::VendorDefined(VendorDefinedMechanism::new::<()>(mechanism_type, None))
+    }
+
+    fn percent_decode_text(value: &str) -> Result<String, CliError> {
+        String::from_utf8(percent_decode_bytes(value)?)
+            .map_err(|_| CliError::Usage("PKCS#11 URI contains non-UTF-8 text".to_string()))
+    }
+
+    fn percent_decode_bytes(value: &str) -> Result<Vec<u8>, CliError> {
+        let bytes = value.as_bytes();
+        let mut decoded = Vec::with_capacity(bytes.len());
+        let mut index = 0;
+        while index < bytes.len() {
+            if bytes[index] == b'%' {
+                if index + 2 >= bytes.len() {
+                    return Err(CliError::Usage(format!(
+                        "invalid percent escape in PKCS#11 URI: {value}"
+                    )));
+                }
+                let high = hex_nibble(bytes[index + 1]).ok_or_else(|| {
+                    CliError::Usage(format!("invalid percent escape in PKCS#11 URI: {value}"))
+                })?;
+                let low = hex_nibble(bytes[index + 2]).ok_or_else(|| {
+                    CliError::Usage(format!("invalid percent escape in PKCS#11 URI: {value}"))
+                })?;
+                decoded.push((high << 4) | low);
+                index += 3;
+            } else {
+                decoded.push(bytes[index]);
+                index += 1;
+            }
+        }
+        Ok(decoded)
+    }
+
+    fn hex_nibble(byte: u8) -> Option<u8> {
+        match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            b'A'..=b'F' => Some(byte - b'A' + 10),
+            _ => None,
         }
     }
 }
@@ -366,6 +641,20 @@ impl DigestAlgorithm {
             Self::Gost3411_2012_512 => 64,
         }
     }
+
+    pub fn digest_oid(self) -> const_oid::ObjectIdentifier {
+        match self {
+            Self::Gost3411_2012_256 => const_oid::ObjectIdentifier::new_unwrap("1.2.643.7.1.1.2.2"),
+            Self::Gost3411_2012_512 => const_oid::ObjectIdentifier::new_unwrap("1.2.643.7.1.1.2.3"),
+        }
+    }
+
+    pub fn signature_oid(self) -> const_oid::ObjectIdentifier {
+        match self {
+            Self::Gost3411_2012_256 => const_oid::ObjectIdentifier::new_unwrap("1.2.643.7.1.1.1.1"),
+            Self::Gost3411_2012_512 => const_oid::ObjectIdentifier::new_unwrap("1.2.643.7.1.1.1.2"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -403,6 +692,7 @@ pub struct SignCommand {
     pub digest: DigestAlgorithm,
     pub transport: Transport,
     pub pkcs11_module: Option<PathBuf>,
+    pub pin: Option<String>,
     pub ccid_reader: Option<String>,
     pub embed_content: bool,
     pub dry_run: bool,
@@ -462,6 +752,7 @@ impl SignCommand {
         let mut digest = DigestAlgorithm::Gost3411_2012_256;
         let mut transport = Transport::Pkcs11;
         let mut pkcs11_module = None;
+        let mut pin = None;
         let mut ccid_reader = None;
         let mut embed_content = false;
         let mut dry_run = false;
@@ -492,6 +783,14 @@ impl SignCommand {
                 "--pkcs11-module" => {
                     pkcs11_module = Some(PathBuf::from(next_value(&mut iter, "--pkcs11-module")?))
                 }
+                "--pin-env" => {
+                    let name = next_value(&mut iter, "--pin-env")?
+                        .to_string_lossy()
+                        .into_owned();
+                    pin = Some(env::var(&name).map_err(|_| {
+                        CliError::Usage(format!("--pin-env variable is not set: {name}"))
+                    })?)
+                }
                 "--ccid-reader" => {
                     ccid_reader = Some(
                         next_value(&mut iter, "--ccid-reader")?
@@ -519,6 +818,7 @@ impl SignCommand {
             digest,
             transport,
             pkcs11_module,
+            pin,
             ccid_reader,
             embed_content,
             dry_run,
@@ -547,6 +847,11 @@ impl SignCommand {
                 ));
             };
             token::ensure_module_path(module)?;
+            if !self.dry_run && self.pin.is_none() {
+                return Err(CliError::Usage(
+                    String::from("--pin-env is required for live PKCS#11 signing\n\n") + &usage(),
+                ));
+            }
         }
 
         Ok(())
@@ -578,11 +883,12 @@ impl SignCommand {
             return Ok(self.render_plan(&digest));
         }
 
-        match self.transport {
+        let signature = match self.transport {
             Transport::Pkcs11 => {
                 let signer = token::Pkcs11SignerConfig::new(
                     self.pkcs11_module.clone().expect("validated module"),
                     self.key_uri.clone(),
+                    self.pin.clone(),
                 );
                 token::TokenSigner::sign_digest(&signer, self.digest, &digest)
             }
@@ -592,10 +898,14 @@ impl SignCommand {
                 token::TokenSigner::sign_digest(&signer, self.digest, &digest)
             }
         }?;
-
-        Err(CliError::Message(
-            "CMS signature generation is not yet enabled. This feature requires hardware validation and will be available in a future release.".to_string(),
-        ))
+        let cms_der = cms_envelope::build_signed_data_der(&cms_input, &document, signature)?;
+        fs::write(&self.output, cms_der).map_err(|error| {
+            CliError::Message(format!(
+                "failed to write --output {}: {error}",
+                self.output.display()
+            ))
+        })?;
+        Ok(format!("wrote CMS signature to {}", self.output.display()))
     }
 
     pub fn render_plan(&self, digest: &[u8]) -> String {
@@ -702,6 +1012,7 @@ fn usage() -> String {
            --digest <NAME>           gost12-256/md_gost12_256 (default) or gost12-512\n\
            --transport <NAME>        pkcs11 (default) or ccid\n\
            --pkcs11-module <FILE>    PKCS#11 module used by the cryptoki Rust crate\n\
+           --pin-env <NAME>          Read the user PIN from an environment variable\n\
            --ccid-reader <NAME>      CCID reader selector for direct USB/APDU work\n\
            --embed-content           Produce an attached CMS object after signing\n\
            --dry-run                 Hash input and print the native signing plan\n\
@@ -715,6 +1026,7 @@ fn usage() -> String {
 mod tests {
     use super::{
         CliError, DigestAlgorithm, SignCommand, Transport, apdu, ccid, cms_envelope, gost, run_cli,
+        token,
     };
     use std::{
         env,
@@ -745,12 +1057,14 @@ mod tests {
             OsString::from("md_gost12_256"),
             OsString::from("--pkcs11-module"),
             module.clone().into_os_string(),
+            OsString::from("--dry-run"),
         ])
         .expect("command should parse");
 
         assert_eq!(command.digest, DigestAlgorithm::Gost3411_2012_256);
         assert_eq!(command.transport, Transport::Pkcs11);
         assert_eq!(command.pkcs11_module.as_deref(), Some(module.as_path()));
+        assert_eq!(command.pin, None);
     }
 
     #[test]
@@ -892,6 +1206,66 @@ mod tests {
         .expect_err("missing PKCS#11 module should fail");
 
         assert!(matches!(error, CliError::Usage(message) if message.contains("--pkcs11-module")));
+    }
+
+    #[test]
+    fn live_pkcs11_signing_requires_pin() {
+        let temp = TempDir::new();
+        let input = temp.write_file("document.txt", "hello");
+        let cert = temp.write_file("signer.der", "certificate");
+        let module = temp.write_file("pkcs11-module.so", "driver");
+        let output = temp.path().join("document.txt.p7s");
+
+        let error = SignCommand::parse([
+            OsString::from("--input"),
+            input.into_os_string(),
+            OsString::from("--output"),
+            output.into_os_string(),
+            OsString::from("--cert"),
+            cert.into_os_string(),
+            OsString::from("--key-uri"),
+            OsString::from("pkcs11:token=Signer;id=%01"),
+            OsString::from("--pkcs11-module"),
+            module.into_os_string(),
+        ])
+        .expect_err("live signing without pin should fail");
+
+        assert!(matches!(error, CliError::Usage(message) if message.contains("--pin")));
+    }
+
+    #[test]
+    fn parses_pkcs11_uri_private_key_selector() {
+        let selector =
+            token::KeyUriSelector::parse("pkcs11:token=Signer%20Token;id=%01%ab;object=Key")
+                .expect("PKCS#11 URI should parse");
+
+        assert_eq!(selector.token.as_deref(), Some("Signer Token"));
+        assert_eq!(selector.id.as_deref(), Some(&[0x01, 0xab][..]));
+        assert_eq!(selector.object.as_deref(), Some("Key"));
+        assert_eq!(
+            selector.private_key_template(),
+            vec![
+                cryptoki::object::Attribute::Class(cryptoki::object::ObjectClass::PRIVATE_KEY),
+                cryptoki::object::Attribute::Sign(true),
+                cryptoki::object::Attribute::Id(vec![0x01, 0xab]),
+                cryptoki::object::Attribute::Label(b"Key".to_vec()),
+            ]
+        );
+    }
+
+    #[test]
+    fn cms_builder_rejects_empty_signature() {
+        let input = cms_envelope::CmsSigningInput::new(
+            vec![0; DigestAlgorithm::Gost3411_2012_256.output_len()],
+            DigestAlgorithm::Gost3411_2012_256,
+            vec![1],
+            true,
+        );
+
+        let error = cms_envelope::build_signed_data_der(&input, b"hello", Vec::new())
+            .expect_err("empty signatures should fail");
+
+        assert!(matches!(error, CliError::Message(message) if message.contains("signature")));
     }
 
     struct TempDir {
