@@ -368,6 +368,7 @@ fn usage() -> String {
          \n\
          Minimal native Rust wrapper around OpenSSL CMS signing for token-backed keys.\n\
          The private key stays on the token; the certificate is provided as a PEM file.\n\
+         Works with PKCS#11-backed tokens such as Рутокен ЭЦП 3.0.\n\
          \n\
          Options:\n\
            --provider <NAME>         OpenSSL provider name (default: pkcs11)\n\
@@ -382,7 +383,7 @@ fn usage() -> String {
          Example:\n\
            cryptokiddie sign --input contract.pdf --output contract.pdf.p7s \\\n\
              --cert signer.pem --key-uri pkcs11:token=Signer;id=%01 \\\n\
-             --pkcs11-module ./crypto-pro-pkcs11.so --dry-run\n",
+             --pkcs11-module ./librtpkcs11ecp.so --dry-run\n",
     )
 }
 
@@ -545,10 +546,7 @@ mod tests {
 
         assert_eq!(
             command.environment(),
-            vec![(
-                "PKCS11_PROVIDER_MODULE",
-                module.as_os_str().to_os_string(),
-            )]
+            vec![("PKCS11_PROVIDER_MODULE", module.as_os_str().to_os_string(),)]
         );
     }
 
