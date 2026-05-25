@@ -1,5 +1,4 @@
 use std::{
-    env,
     ffi::OsString,
     fmt::{self, Write as _},
     fs,
@@ -224,11 +223,13 @@ pub mod cms_envelope {
             Some(any_from_der(
                 &OctetString::new(document)
                     .map_err(|error| {
-                        CliError::Message(format!("failed to encode content: {error}"))
+                        CliError::Message(format!(
+                            "failed to construct content OCTET STRING: {error}"
+                        ))
                     })?
                     .to_der()
                     .map_err(|error| {
-                        CliError::Message(format!("failed to encode content: {error}"))
+                        CliError::Message(format!("failed to serialize content DER: {error}"))
                     })?,
             )?)
         };
@@ -315,16 +316,16 @@ pub mod token {
     pub struct Pkcs11SignerConfig {
         pub module: PathBuf,
         pub key_uri: String,
-        pub pin: Option<String>,
+        pub pin_env: Option<String>,
         pub mechanism: &'static str,
     }
 
     impl Pkcs11SignerConfig {
-        pub fn new(module: PathBuf, key_uri: String, pin: Option<String>) -> Self {
+        pub fn new(module: PathBuf, key_uri: String, pin_env: Option<String>) -> Self {
             Self {
                 module,
                 key_uri,
-                pin,
+                pin_env,
                 mechanism: GOST3410_2012_256_MECHANISM,
             }
         }
@@ -402,7 +403,7 @@ pub mod token {
             let session = ctx.open_rw_session(slot).map_err(|error| {
                 CliError::Message(format!("failed to open PKCS#11 session: {error}"))
             })?;
-            let pin = self.pin.as_deref().map(|pin| AuthPin::new(pin.into()));
+            let pin = self.pin_env.as_deref().map(load_pin).transpose()?;
             session
                 .login(UserType::User, pin.as_ref())
                 .map_err(|error| {
@@ -478,6 +479,7 @@ pub mod token {
                 object: None,
             };
 
+            // Supports the RFC 7512 attributes needed for this token path: token/slot/id/object.
             for pair in attributes.split(';').filter(|pair| !pair.is_empty()) {
                 let Some((name, value)) = pair.split_once('=') else {
                     return Err(CliError::Usage(format!(
@@ -487,8 +489,10 @@ pub mod token {
                 match name {
                     "token" => selector.token = Some(percent_decode_text(value)?),
                     "slot" | "slot-id" => {
-                        selector.slot = Some(value.parse::<u64>().map_err(|_| {
-                            CliError::Usage(format!("invalid numeric --key-uri {name}: {value}"))
+                        selector.slot = Some(value.parse::<u64>().map_err(|error| {
+                            CliError::Usage(format!(
+                                "invalid numeric --key-uri {name}: {value} ({error})"
+                            ))
                         })?)
                     }
                     "id" => selector.id = Some(percent_decode_bytes(value)?),
@@ -560,6 +564,16 @@ pub mod token {
             std::mem::transmute::<cryptoki_sys::CK_MECHANISM_TYPE, MechanismType>(CKM_GOSTR3410)
         };
         Mechanism::VendorDefined(VendorDefinedMechanism::new::<()>(mechanism_type, None))
+    }
+
+    fn load_pin(name: &str) -> Result<AuthPin, CliError> {
+        std::env::var(name)
+            .map(|pin| AuthPin::new(pin.into()))
+            .map_err(|error| {
+                CliError::Usage(format!(
+                    "--pin-env variable {name} is not set or contains invalid UTF-8: {error}"
+                ))
+            })
     }
 
     fn percent_decode_text(value: &str) -> Result<String, CliError> {
@@ -702,7 +716,7 @@ pub struct SignCommand {
     pub digest: DigestAlgorithm,
     pub transport: Transport,
     pub pkcs11_module: Option<PathBuf>,
-    pub pin: Option<String>,
+    pub pin_env: Option<String>,
     pub ccid_reader: Option<String>,
     pub embed_content: bool,
     pub dry_run: bool,
@@ -762,7 +776,7 @@ impl SignCommand {
         let mut digest = DigestAlgorithm::Gost3411_2012_256;
         let mut transport = Transport::Pkcs11;
         let mut pkcs11_module = None;
-        let mut pin = None;
+        let mut pin_env = None;
         let mut ccid_reader = None;
         let mut embed_content = false;
         let mut dry_run = false;
@@ -797,9 +811,7 @@ impl SignCommand {
                     let name = next_value(&mut iter, "--pin-env")?
                         .to_string_lossy()
                         .into_owned();
-                    pin = Some(env::var(&name).map_err(|_| {
-                        CliError::Usage(format!("--pin-env variable is not set: {name}"))
-                    })?)
+                    pin_env = Some(name);
                 }
                 "--ccid-reader" => {
                     ccid_reader = Some(
@@ -828,7 +840,7 @@ impl SignCommand {
             digest,
             transport,
             pkcs11_module,
-            pin,
+            pin_env,
             ccid_reader,
             embed_content,
             dry_run,
@@ -857,7 +869,7 @@ impl SignCommand {
                 ));
             };
             token::ensure_module_path(module)?;
-            if !self.dry_run && self.pin.is_none() {
+            if !self.dry_run && self.pin_env.is_none() {
                 return Err(CliError::Usage(
                     String::from("--pin-env is required for live PKCS#11 signing\n\n") + &usage(),
                 ));
@@ -898,7 +910,7 @@ impl SignCommand {
                 let signer = token::Pkcs11SignerConfig::new(
                     self.pkcs11_module.clone().expect("validated module"),
                     self.key_uri.clone(),
-                    self.pin.clone(),
+                    self.pin_env.clone(),
                 );
                 token::TokenSigner::sign_digest(&signer, self.digest, &digest)
             }
@@ -1074,7 +1086,7 @@ mod tests {
         assert_eq!(command.digest, DigestAlgorithm::Gost3411_2012_256);
         assert_eq!(command.transport, Transport::Pkcs11);
         assert_eq!(command.pkcs11_module.as_deref(), Some(module.as_path()));
-        assert_eq!(command.pin, None);
+        assert_eq!(command.pin_env, None);
     }
 
     #[test]
