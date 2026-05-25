@@ -415,6 +415,7 @@ pub mod gost {
         match algorithm {
             DigestAlgorithm::Gost3411_2012_256 => Streebog256::digest(data).to_vec(),
             DigestAlgorithm::Gost3411_2012_512 => Streebog512::digest(data).to_vec(),
+            _ => panic!("non-GOST algorithm {algorithm:?} passed to gost::hash"),
         }
     }
 
@@ -528,8 +529,20 @@ pub mod rutoken {
     }
 }
 
+pub fn compute_digest(data: &[u8], algorithm: DigestAlgorithm) -> Vec<u8> {
+    use sha2::Digest as _;
+    match algorithm {
+        DigestAlgorithm::Gost3411_2012_256 | DigestAlgorithm::Gost3411_2012_512 => {
+            gost::hash(data, algorithm)
+        }
+        DigestAlgorithm::Sha256 => sha2::Sha256::digest(data).to_vec(),
+        DigestAlgorithm::Sha384 => sha2::Sha384::digest(data).to_vec(),
+        DigestAlgorithm::Sha512 => sha2::Sha512::digest(data).to_vec(),
+    }
+}
+
 pub mod cms_envelope {
-    use super::{CliError, DigestAlgorithm};
+    use super::{CliError, DigestAlgorithm, KeyAlgorithm};
     use cms::{
         cert::{CertificateChoices, x509::Certificate},
         content_info::{CmsVersion, ContentInfo},
@@ -545,6 +558,7 @@ pub mod cms_envelope {
     pub struct CmsSigningInput {
         pub content_digest: Vec<u8>,
         pub digest_algorithm: DigestAlgorithm,
+        pub key_algorithm: KeyAlgorithm,
         pub signer_certificate: Vec<u8>,
         pub detached: bool,
     }
@@ -553,12 +567,14 @@ pub mod cms_envelope {
         pub fn new(
             content_digest: Vec<u8>,
             digest_algorithm: DigestAlgorithm,
+            key_algorithm: KeyAlgorithm,
             signer_certificate: Vec<u8>,
             detached: bool,
         ) -> Self {
             Self {
                 content_digest,
                 digest_algorithm,
+                key_algorithm,
                 signer_certificate,
                 detached,
             }
@@ -580,6 +596,10 @@ pub mod cms_envelope {
             }
             Ok(())
         }
+
+        fn signature_oid(&self) -> Result<const_oid::ObjectIdentifier, CliError> {
+            self.key_algorithm.signature_oid(self.digest_algorithm)
+        }
     }
 
     pub fn build_signed_data_der(
@@ -595,7 +615,7 @@ pub mod cms_envelope {
         let certificate = Certificate::from_der(&input.signer_certificate)
             .map_err(|error| CliError::Message(format!("failed to parse --cert DER: {error}")))?;
         let digest_algorithm = algorithm_identifier(input.digest_algorithm.digest_oid());
-        let signature_algorithm = algorithm_identifier(input.digest_algorithm.signature_oid());
+        let signature_algorithm = algorithm_identifier(input.signature_oid()?);
         let econtent = if input.detached {
             None
         } else {
@@ -677,7 +697,7 @@ pub mod cms_envelope {
 }
 
 pub mod token {
-    use super::{CliError, DigestAlgorithm};
+    use super::{CliError, DigestAlgorithm, KeyAlgorithm};
     use cryptoki::{
         context::{CInitializeArgs, CInitializeFlags, Pkcs11},
         mechanism::{Mechanism, MechanismType, vendor_defined::VendorDefinedMechanism},
@@ -689,23 +709,26 @@ pub mod token {
     use cryptoki_sys::CKM_GOSTR3410;
     use std::path::{Path, PathBuf};
 
-    pub const GOST3410_2012_256_MECHANISM: &str = "CKM_GOSTR3410_2012_256";
-
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct Pkcs11SignerConfig {
         pub module: PathBuf,
         pub key_uri: String,
         pub pin_env: Option<String>,
-        pub mechanism: &'static str,
+        pub key_algorithm: KeyAlgorithm,
     }
 
     impl Pkcs11SignerConfig {
-        pub fn new(module: PathBuf, key_uri: String, pin_env: Option<String>) -> Self {
+        pub fn new(
+            module: PathBuf,
+            key_uri: String,
+            pin_env: Option<String>,
+            key_algorithm: KeyAlgorithm,
+        ) -> Self {
             Self {
                 module,
                 key_uri,
                 pin_env,
-                mechanism: GOST3410_2012_256_MECHANISM,
+                key_algorithm,
             }
         }
 
@@ -728,16 +751,21 @@ pub mod token {
         pub reader: Option<String>,
         pub key_uri: String,
         pub pin_env: Option<String>,
-        pub mechanism: &'static str,
+        pub key_algorithm: KeyAlgorithm,
     }
 
     impl CcidSignerConfig {
-        pub fn new(reader: Option<String>, key_uri: String, pin_env: Option<String>) -> Self {
+        pub fn new(
+            reader: Option<String>,
+            key_uri: String,
+            pin_env: Option<String>,
+            key_algorithm: KeyAlgorithm,
+        ) -> Self {
             Self {
                 reader,
                 key_uri,
                 pin_env,
-                mechanism: GOST3410_2012_256_MECHANISM,
+                key_algorithm,
             }
         }
     }
@@ -801,10 +829,11 @@ pub mod token {
                 .ok_or_else(|| {
                     CliError::Message("--key-uri did not match a token private key".to_string())
                 })?;
-            let mechanism = gost3410_mechanism();
+            let mechanism = signing_mechanism(self.key_algorithm)?;
+            let sign_input = prepare_sign_input(self.key_algorithm, digest_algorithm, digest)?;
 
             session
-                .sign(&mechanism, key, digest)
+                .sign(&mechanism, key, &sign_input)
                 .map_err(|error| CliError::Message(format!("PKCS#11 C_Sign failed: {error}")))
         }
     }
@@ -879,6 +908,12 @@ pub mod token {
             let signature_len = match digest_algorithm {
                 DigestAlgorithm::Gost3411_2012_256 => 64u8,
                 DigestAlgorithm::Gost3411_2012_512 => 128u8,
+                _ => {
+                    return Err(CliError::Message(format!(
+                        "CCID/Rutoken transport only supports GOST digests, got {}",
+                        digest_algorithm.name()
+                    )));
+                }
             };
             let resp = device.transmit(&super::rutoken::pso_compute_digital_signature(
                 digest,
@@ -1008,6 +1043,87 @@ pub mod token {
         }
     }
 
+    fn signing_mechanism(key_algorithm: KeyAlgorithm) -> Result<Mechanism<'static>, CliError> {
+        match key_algorithm {
+            KeyAlgorithm::Gost3410_2012_256 | KeyAlgorithm::Gost3410_2012_512 => {
+                Ok(gost3410_mechanism())
+            }
+            KeyAlgorithm::Ecdsa => Ok(Mechanism::Ecdsa),
+            KeyAlgorithm::Rsa => Ok(Mechanism::RsaPkcs),
+        }
+    }
+
+    /// Prepare the data buffer passed to `C_Sign`.
+    ///
+    /// - GOST and ECDSA accept raw digest bytes.
+    /// - RSA PKCS#1 v1.5 (`CKM_RSA_PKCS`) requires a DER-encoded DigestInfo wrapper so that
+    ///   the token can apply the correct PKCS#1 block format without knowing the hash algorithm.
+    fn prepare_sign_input(
+        key_algorithm: KeyAlgorithm,
+        digest_algorithm: DigestAlgorithm,
+        digest: &[u8],
+    ) -> Result<Vec<u8>, CliError> {
+        match key_algorithm {
+            KeyAlgorithm::Rsa => wrap_digest_info(digest_algorithm, digest),
+            _ => Ok(digest.to_vec()),
+        }
+    }
+
+    /// Build a DER-encoded `DigestInfo` structure for RSA PKCS#1 v1.5 signing.
+    ///
+    /// `DigestInfo ::= SEQUENCE { digestAlgorithm AlgorithmIdentifier, digest OCTET STRING }`
+    ///
+    /// The prefix bytes are the fixed DER encoding of the outer SEQUENCE header and the
+    /// AlgorithmIdentifier for each supported hash; the hash bytes follow immediately.
+    fn wrap_digest_info(
+        digest_algorithm: DigestAlgorithm,
+        hash: &[u8],
+    ) -> Result<Vec<u8>, CliError> {
+        // Each prefix encodes:
+        //   30 <total-len>          -- SEQUENCE (DigestInfo)
+        //     30 0d                 -- SEQUENCE (AlgorithmIdentifier), length 13
+        //       06 09 <oid-bytes>   -- OID (hash algorithm)
+        //       05 00               -- NULL (parameters)
+        //     04 <hash-len>         -- OCTET STRING (digest value)
+        //
+        // SHA-256: OID 2.16.840.1.101.3.4.2.1 (9 bytes), hash 32 bytes → total 49 (0x31)
+        // SHA-384: OID 2.16.840.1.101.3.4.2.2 (9 bytes), hash 48 bytes → total 65 (0x41)
+        // SHA-512: OID 2.16.840.1.101.3.4.2.3 (9 bytes), hash 64 bytes → total 81 (0x51)
+        let prefix: &[u8] = match digest_algorithm {
+            DigestAlgorithm::Sha256 => &[
+                0x30, 0x31, // SEQUENCE, 49 bytes
+                0x30, 0x0d, // SEQUENCE (AlgorithmIdentifier), 13 bytes
+                0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02,
+                0x01, // OID sha-256
+                0x05, 0x00, // NULL
+                0x04, 0x20, // OCTET STRING, 32 bytes
+            ],
+            DigestAlgorithm::Sha384 => &[
+                0x30, 0x41, // SEQUENCE, 65 bytes
+                0x30, 0x0d, // SEQUENCE (AlgorithmIdentifier), 13 bytes
+                0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02,
+                0x02, // OID sha-384
+                0x05, 0x00, // NULL
+                0x04, 0x30, // OCTET STRING, 48 bytes
+            ],
+            DigestAlgorithm::Sha512 => &[
+                0x30, 0x51, // SEQUENCE, 81 bytes
+                0x30, 0x0d, // SEQUENCE (AlgorithmIdentifier), 13 bytes
+                0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02,
+                0x03, // OID sha-512
+                0x05, 0x00, // NULL
+                0x04, 0x40, // OCTET STRING, 64 bytes
+            ],
+            other => {
+                return Err(CliError::Message(format!(
+                    "RSA DigestInfo wrapping is not supported for {}",
+                    other.name()
+                )));
+            }
+        };
+        Ok([prefix, hash].concat())
+    }
+
     fn gost3410_mechanism() -> Mechanism<'static> {
         const _: [(); std::mem::size_of::<cryptoki_sys::CK_MECHANISM_TYPE>()] =
             [(); std::mem::size_of::<MechanismType>()];
@@ -1038,6 +1154,17 @@ pub mod token {
 pub enum DigestAlgorithm {
     Gost3411_2012_256,
     Gost3411_2012_512,
+    Sha256,
+    Sha384,
+    Sha512,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyAlgorithm {
+    Gost3410_2012_256,
+    Gost3410_2012_512,
+    Ecdsa,
+    Rsa,
 }
 
 const OID_GOST3410_2012_256: const_oid::ObjectIdentifier =
@@ -1049,13 +1176,40 @@ const OID_GOST3411_2012_256: const_oid::ObjectIdentifier =
 const OID_GOST3411_2012_512: const_oid::ObjectIdentifier =
     const_oid::ObjectIdentifier::new_unwrap("1.2.643.7.1.1.2.3");
 
+// SHA-2 digest OIDs (RFC 5912)
+const OID_SHA256: const_oid::ObjectIdentifier =
+    const_oid::ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.1");
+const OID_SHA384: const_oid::ObjectIdentifier =
+    const_oid::ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.2");
+const OID_SHA512: const_oid::ObjectIdentifier =
+    const_oid::ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.3");
+
+// ECDSA signature OIDs (RFC 5912)
+const OID_ECDSA_WITH_SHA256: const_oid::ObjectIdentifier =
+    const_oid::ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2");
+const OID_ECDSA_WITH_SHA384: const_oid::ObjectIdentifier =
+    const_oid::ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.3");
+const OID_ECDSA_WITH_SHA512: const_oid::ObjectIdentifier =
+    const_oid::ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.4");
+
+// RSA PKCS#1 v1.5 signature OIDs (RFC 5912)
+const OID_SHA256_WITH_RSA: const_oid::ObjectIdentifier =
+    const_oid::ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.11");
+const OID_SHA384_WITH_RSA: const_oid::ObjectIdentifier =
+    const_oid::ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.12");
+const OID_SHA512_WITH_RSA: const_oid::ObjectIdentifier =
+    const_oid::ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.13");
+
 impl DigestAlgorithm {
     pub fn parse(name: &str) -> Result<Self, CliError> {
         match name {
             "gost3411-2012-256" | "gost12-256" => Ok(Self::Gost3411_2012_256),
             "gost3411-2012-512" | "gost12-512" => Ok(Self::Gost3411_2012_512),
+            "sha256" | "sha-256" => Ok(Self::Sha256),
+            "sha384" | "sha-384" => Ok(Self::Sha384),
+            "sha512" | "sha-512" => Ok(Self::Sha512),
             _ => Err(CliError::Usage(format!(
-                "unsupported --digest {name}; expected gost12-256 or gost12-512\n\n{}",
+                "unsupported --digest {name}; expected gost12-256, gost12-512, sha256, sha384, or sha512\n\n{}",
                 usage()
             ))),
         }
@@ -1065,6 +1219,9 @@ impl DigestAlgorithm {
         match self {
             Self::Gost3411_2012_256 => "ГОСТ Р 34.11-2012-256",
             Self::Gost3411_2012_512 => "ГОСТ Р 34.11-2012-512",
+            Self::Sha256 => "SHA-256",
+            Self::Sha384 => "SHA-384",
+            Self::Sha512 => "SHA-512",
         }
     }
 
@@ -1072,6 +1229,9 @@ impl DigestAlgorithm {
         match self {
             Self::Gost3411_2012_256 => "gost12-256",
             Self::Gost3411_2012_512 => "gost12-512",
+            Self::Sha256 => "sha256",
+            Self::Sha384 => "sha384",
+            Self::Sha512 => "sha512",
         }
     }
 
@@ -1079,6 +1239,9 @@ impl DigestAlgorithm {
         match self {
             Self::Gost3411_2012_256 => 32,
             Self::Gost3411_2012_512 => 64,
+            Self::Sha256 => 32,
+            Self::Sha384 => 48,
+            Self::Sha512 => 64,
         }
     }
 
@@ -1086,13 +1249,80 @@ impl DigestAlgorithm {
         match self {
             Self::Gost3411_2012_256 => OID_GOST3411_2012_256,
             Self::Gost3411_2012_512 => OID_GOST3411_2012_512,
+            Self::Sha256 => OID_SHA256,
+            Self::Sha384 => OID_SHA384,
+            Self::Sha512 => OID_SHA512,
+        }
+    }
+}
+
+impl KeyAlgorithm {
+    pub fn parse(name: &str) -> Result<Self, CliError> {
+        match name {
+            "gost3410-2012-256" | "gost3410-256" => Ok(Self::Gost3410_2012_256),
+            "gost3410-2012-512" | "gost3410-512" => Ok(Self::Gost3410_2012_512),
+            "ecdsa" => Ok(Self::Ecdsa),
+            "rsa" => Ok(Self::Rsa),
+            _ => Err(CliError::Usage(format!(
+                "unsupported --key-algorithm {name}; expected gost3410-2012-256, gost3410-2012-512, ecdsa, or rsa\n\n{}",
+                usage()
+            ))),
         }
     }
 
-    pub fn signature_oid(self) -> const_oid::ObjectIdentifier {
+    /// Returns the default key algorithm implied by the chosen digest algorithm.
+    ///
+    /// GOST digests pair with GOST signing keys; SHA-2 digests default to ECDSA.
+    pub fn default_for_digest(digest: DigestAlgorithm) -> Self {
+        match digest {
+            DigestAlgorithm::Gost3411_2012_256 => Self::Gost3410_2012_256,
+            DigestAlgorithm::Gost3411_2012_512 => Self::Gost3410_2012_512,
+            DigestAlgorithm::Sha256 | DigestAlgorithm::Sha384 | DigestAlgorithm::Sha512 => {
+                Self::Ecdsa
+            }
+        }
+    }
+
+    pub fn cli_name(self) -> &'static str {
         match self {
-            Self::Gost3411_2012_256 => OID_GOST3410_2012_256,
-            Self::Gost3411_2012_512 => OID_GOST3410_2012_512,
+            Self::Gost3410_2012_256 => "gost3410-2012-256",
+            Self::Gost3410_2012_512 => "gost3410-2012-512",
+            Self::Ecdsa => "ecdsa",
+            Self::Rsa => "rsa",
+        }
+    }
+
+    /// Returns the CMS `signatureAlgorithm` OID for this key algorithm combined with the
+    /// given digest algorithm.
+    ///
+    /// Returns an error if the combination is semantically invalid (e.g. ECDSA with a GOST
+    /// digest), since the CMS signatureAlgorithm must accurately reflect both the key type
+    /// and the hash algorithm used (RFC 5652 §5.4).
+    pub fn signature_oid(
+        self,
+        digest: DigestAlgorithm,
+    ) -> Result<const_oid::ObjectIdentifier, CliError> {
+        match (self, digest) {
+            (Self::Gost3410_2012_256, DigestAlgorithm::Gost3411_2012_256) => {
+                Ok(OID_GOST3410_2012_256)
+            }
+            (Self::Gost3410_2012_512, DigestAlgorithm::Gost3411_2012_512) => {
+                Ok(OID_GOST3410_2012_512)
+            }
+            (Self::Ecdsa, DigestAlgorithm::Sha256) => Ok(OID_ECDSA_WITH_SHA256),
+            (Self::Ecdsa, DigestAlgorithm::Sha384) => Ok(OID_ECDSA_WITH_SHA384),
+            (Self::Ecdsa, DigestAlgorithm::Sha512) => Ok(OID_ECDSA_WITH_SHA512),
+            (Self::Rsa, DigestAlgorithm::Sha256) => Ok(OID_SHA256_WITH_RSA),
+            (Self::Rsa, DigestAlgorithm::Sha384) => Ok(OID_SHA384_WITH_RSA),
+            (Self::Rsa, DigestAlgorithm::Sha512) => Ok(OID_SHA512_WITH_RSA),
+            (key_alg, digest_alg) => Err(CliError::Usage(format!(
+                "--key-algorithm {} is not compatible with --digest {}; \
+                 the signature algorithm OID must accurately reflect both the key type \
+                 and the hash algorithm\n\n{}",
+                key_alg.cli_name(),
+                digest_alg.cli_name(),
+                usage()
+            ))),
         }
     }
 }
@@ -1130,6 +1360,7 @@ pub struct SignCommand {
     pub cert: PathBuf,
     pub key_uri: String,
     pub digest: DigestAlgorithm,
+    pub key_algorithm: KeyAlgorithm,
     pub transport: Transport,
     pub pkcs11_module: Option<PathBuf>,
     pub pin_env: Option<String>,
@@ -1190,6 +1421,7 @@ impl SignCommand {
         let mut cert = None;
         let mut key_uri = None;
         let mut digest = DigestAlgorithm::Gost3411_2012_256;
+        let mut key_algorithm_override: Option<KeyAlgorithm> = None;
         let mut transport = Transport::Pkcs11;
         let mut pkcs11_module = None;
         let mut pin_env = None;
@@ -1212,6 +1444,13 @@ impl SignCommand {
                             .to_string_lossy()
                             .as_ref(),
                     )?
+                }
+                "--key-algorithm" => {
+                    key_algorithm_override = Some(KeyAlgorithm::parse(
+                        next_value(&mut iter, "--key-algorithm")?
+                            .to_string_lossy()
+                            .as_ref(),
+                    )?)
                 }
                 "--transport" => {
                     transport = Transport::parse(
@@ -1248,12 +1487,16 @@ impl SignCommand {
             }
         }
 
+        let key_algorithm =
+            key_algorithm_override.unwrap_or_else(|| KeyAlgorithm::default_for_digest(digest));
+
         let command = Self {
             input: required_path(input, "--input")?,
             output: required_path(output, "--output")?,
             cert: required_path(cert, "--cert")?,
             key_uri: required_string(key_uri, "--key-uri")?,
             digest,
+            key_algorithm,
             transport,
             pkcs11_module,
             pin_env,
@@ -1308,10 +1551,11 @@ impl SignCommand {
                 self.cert.display()
             ))
         })?;
-        let digest = gost::hash(&document, self.digest);
+        let digest = compute_digest(&document, self.digest);
         let cms_input = cms_envelope::CmsSigningInput::new(
             digest.clone(),
             self.digest,
+            self.key_algorithm,
             certificate,
             !self.embed_content,
         );
@@ -1327,6 +1571,7 @@ impl SignCommand {
                     self.pkcs11_module.clone().expect("validated module"),
                     self.key_uri.clone(),
                     self.pin_env.clone(),
+                    self.key_algorithm,
                 );
                 token::TokenSigner::sign_digest(&signer, self.digest, &digest)
             }
@@ -1335,6 +1580,7 @@ impl SignCommand {
                     self.ccid_reader.clone(),
                     self.key_uri.clone(),
                     self.pin_env.clone(),
+                    self.key_algorithm,
                 );
                 token::TokenSigner::sign_digest(&signer, self.digest, &digest)
             }
@@ -1358,6 +1604,7 @@ impl SignCommand {
             format!("transport={}", self.transport.name()),
             format!("key_uri={}", self.key_uri),
             format!("digest_algorithm={}", self.digest.cli_name()),
+            format!("key_algorithm={}", self.key_algorithm.cli_name()),
             format!("digest_hex={}", hex_encode(digest)),
             format!("cms_backend={}", cms_envelope::cms_crate_backend()),
         ];
@@ -1370,9 +1617,6 @@ impl SignCommand {
                 }
             }
             Transport::Ccid => {
-                lines.push(format!("ccid_product={}", ccid::RUTOKEN_ECP3_PRODUCT));
-                lines.push(format!("ccid_vid=0x{:04x}", ccid::RUTOKEN_ECP3_USB_VID));
-                lines.push(format!("ccid_pid=0x{:04x}", ccid::RUTOKEN_ECP3_USB_PID));
                 if let Some(reader) = &self.ccid_reader {
                     lines.push(format!("ccid_reader={reader}"));
                 }
@@ -1490,13 +1734,17 @@ fn usage() -> String {
     String::from(
         "cryptokiddie sign --input <FILE> --output <FILE> --cert <FILE> --key-uri <URI> [options]\n\
          \n\
-         Native Rust signing pipeline for token-backed ГОСТ Р 34.10-2012 keys.\n\
-         The document is hashed in-process with ГОСТ Р 34.11-2012; the token is\n\
-         responsible for the hardware signature; CMS SignedData construction is\n\
-         kept behind the RustCrypto cms crate boundary.\n\
+         Native Rust signing pipeline for PKCS#11 token-backed keys.\n\
+         The document is hashed in-process; the token is responsible for the hardware\n\
+         signature; CMS SignedData construction is kept behind the RustCrypto cms crate\n\
+         boundary.\n\
          \n\
          Options:\n\
-           --digest <NAME>           gost12-256 (default) or gost12-512\n\
+           --digest <NAME>           Hash algorithm: gost12-256 (default), gost12-512,\n\
+                                     sha256, sha384, or sha512\n\
+           --key-algorithm <NAME>    Signing key algorithm: gost3410-2012-256 (default\n\
+                                     for GOST digests), gost3410-2012-512, ecdsa\n\
+                                     (default for SHA-2 digests), or rsa\n\
            --transport <NAME>        pkcs11 (default) or ccid\n\
            --pkcs11-module <FILE>    PKCS#11 module used by the cryptoki Rust crate\n\
            --pin-env <NAME>          Read the user PIN from an environment variable\n\
@@ -1504,16 +1752,23 @@ fn usage() -> String {
            --embed-content           Produce an attached CMS object after signing\n\
            --dry-run                 Hash input and print the native signing plan\n\
          \n\
-         Example:\n\
-           cryptokiddie sign --input contract.pdf --output contract.pdf.p7s \\\n             --cert signer.der --key-uri pkcs11:token=Signer;id=%01 \\\n             --digest gost12-256 --pkcs11-module ./opensc-pkcs11.so --dry-run\n",
+         Examples:\n\
+           cryptokiddie sign --input contract.pdf --output contract.pdf.p7s \\\n\
+               --cert signer.der --key-uri pkcs11:token=Signer;id=%01 \\\n\
+               --digest sha256 --key-algorithm ecdsa \\\n\
+               --pkcs11-module ./opensc-pkcs11.so --dry-run\n\
+         \n\
+           cryptokiddie sign --input contract.pdf --output contract.pdf.p7s \\\n\
+               --cert signer.der --key-uri pkcs11:token=Signer;id=%01 \\\n\
+               --digest gost12-256 --pkcs11-module ./gost-pkcs11.so --dry-run\n",
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        CliError, DigestAlgorithm, SignCommand, Transport, apdu, ccid, cms_envelope, gost, run_cli,
-        rutoken, token,
+        CliError, DigestAlgorithm, KeyAlgorithm, SignCommand, Transport, apdu, ccid, cms_envelope,
+        compute_digest, gost, run_cli, rutoken, token,
     };
     use std::{
         env,
@@ -1549,9 +1804,102 @@ mod tests {
         .expect("command should parse");
 
         assert_eq!(command.digest, DigestAlgorithm::Gost3411_2012_256);
+        assert_eq!(command.key_algorithm, KeyAlgorithm::Gost3410_2012_256);
         assert_eq!(command.transport, Transport::Pkcs11);
         assert_eq!(command.pkcs11_module.as_deref(), Some(module.as_path()));
         assert_eq!(command.pin_env, None);
+    }
+
+    #[test]
+    fn parses_sha256_ecdsa_sign_command() {
+        let temp = TempDir::new();
+        let input = temp.write_file("document.txt", "hello");
+        let cert = temp.write_file("signer.der", "certificate");
+        let module = temp.write_file("pkcs11-module.so", "driver");
+        let output = temp.path().join("document.txt.p7s");
+
+        let command = SignCommand::parse([
+            OsString::from("--input"),
+            input.into_os_string(),
+            OsString::from("--output"),
+            output.into_os_string(),
+            OsString::from("--cert"),
+            cert.into_os_string(),
+            OsString::from("--key-uri"),
+            OsString::from("pkcs11:token=Signer;id=%01"),
+            OsString::from("--digest"),
+            OsString::from("sha256"),
+            OsString::from("--key-algorithm"),
+            OsString::from("ecdsa"),
+            OsString::from("--pkcs11-module"),
+            module.clone().into_os_string(),
+            OsString::from("--dry-run"),
+        ])
+        .expect("command should parse");
+
+        assert_eq!(command.digest, DigestAlgorithm::Sha256);
+        assert_eq!(command.key_algorithm, KeyAlgorithm::Ecdsa);
+        assert_eq!(command.transport, Transport::Pkcs11);
+    }
+
+    #[test]
+    fn parses_sha512_rsa_sign_command() {
+        let temp = TempDir::new();
+        let input = temp.write_file("document.txt", "hello");
+        let cert = temp.write_file("signer.der", "certificate");
+        let module = temp.write_file("pkcs11-module.so", "driver");
+        let output = temp.path().join("document.txt.p7s");
+
+        let command = SignCommand::parse([
+            OsString::from("--input"),
+            input.into_os_string(),
+            OsString::from("--output"),
+            output.into_os_string(),
+            OsString::from("--cert"),
+            cert.into_os_string(),
+            OsString::from("--key-uri"),
+            OsString::from("pkcs11:token=Signer;id=%01"),
+            OsString::from("--digest"),
+            OsString::from("sha512"),
+            OsString::from("--key-algorithm"),
+            OsString::from("rsa"),
+            OsString::from("--pkcs11-module"),
+            module.clone().into_os_string(),
+            OsString::from("--dry-run"),
+        ])
+        .expect("command should parse");
+
+        assert_eq!(command.digest, DigestAlgorithm::Sha512);
+        assert_eq!(command.key_algorithm, KeyAlgorithm::Rsa);
+    }
+
+    #[test]
+    fn sha256_digest_defaults_to_ecdsa_key_algorithm() {
+        let temp = TempDir::new();
+        let input = temp.write_file("document.txt", "hello");
+        let cert = temp.write_file("signer.der", "certificate");
+        let module = temp.write_file("pkcs11-module.so", "driver");
+        let output = temp.path().join("document.txt.p7s");
+
+        let command = SignCommand::parse([
+            OsString::from("--input"),
+            input.into_os_string(),
+            OsString::from("--output"),
+            output.into_os_string(),
+            OsString::from("--cert"),
+            cert.into_os_string(),
+            OsString::from("--key-uri"),
+            OsString::from("pkcs11:token=Signer;id=%01"),
+            OsString::from("--digest"),
+            OsString::from("sha256"),
+            OsString::from("--pkcs11-module"),
+            module.into_os_string(),
+            OsString::from("--dry-run"),
+        ])
+        .expect("command should parse");
+
+        assert_eq!(command.digest, DigestAlgorithm::Sha256);
+        assert_eq!(command.key_algorithm, KeyAlgorithm::Ecdsa);
     }
 
     #[test]
@@ -1581,13 +1929,80 @@ mod tests {
         assert!(output.contains("native signing plan"));
         assert!(output.contains("transport=pkcs11"));
         assert!(output.contains("digest_algorithm=gost12-256"));
+        assert!(output.contains("key_algorithm=gost3410-2012-256"));
         assert!(output.contains("pkcs11_backend=cryptoki::context::Pkcs11"));
         assert!(output.contains("cms_backend=cms::content_info::ContentInfo"));
         assert!(!output.contains("openssl"));
     }
 
     #[test]
-    fn renders_ccid_rutoken_identity_in_dry_run() {
+    fn dry_run_accepts_rutoken_gost_via_generic_pkcs11_uri() {
+        let temp = TempDir::new();
+        let input = temp.write_file("document.txt", "hello");
+        let cert = temp.write_file("signer.der", "certificate");
+        let module = temp.write_file("pkcs11-module.so", "driver");
+        let output = temp.path().join("document.txt.p7s");
+
+        let output = run_cli([
+            OsString::from("sign"),
+            OsString::from("--input"),
+            input.into_os_string(),
+            OsString::from("--output"),
+            output.into_os_string(),
+            OsString::from("--cert"),
+            cert.into_os_string(),
+            OsString::from("--key-uri"),
+            OsString::from("pkcs11:token=Rutoken;id=%01"),
+            OsString::from("--digest"),
+            OsString::from("gost12-256"),
+            OsString::from("--pkcs11-module"),
+            module.into_os_string(),
+            OsString::from("--dry-run"),
+        ])
+        .expect("Rutoken/GOST dry run should use generic PKCS#11 path");
+
+        assert!(output.contains("transport=pkcs11"));
+        assert!(output.contains("key_uri=pkcs11:token=Rutoken;id=%01"));
+        assert!(output.contains("digest_algorithm=gost12-256"));
+        assert!(output.contains("key_algorithm=gost3410-2012-256"));
+    }
+
+    #[test]
+    fn dry_run_sha256_ecdsa_renders_plan() {
+        let temp = TempDir::new();
+        let input = temp.write_file("document.txt", "hello");
+        let cert = temp.write_file("signer.der", "certificate");
+        let module = temp.write_file("pkcs11-module.so", "driver");
+        let output = temp.path().join("document.txt.p7s");
+
+        let output = run_cli([
+            OsString::from("sign"),
+            OsString::from("--input"),
+            input.into_os_string(),
+            OsString::from("--output"),
+            output.into_os_string(),
+            OsString::from("--cert"),
+            cert.into_os_string(),
+            OsString::from("--key-uri"),
+            OsString::from("pkcs11:token=Signer;id=%01"),
+            OsString::from("--digest"),
+            OsString::from("sha256"),
+            OsString::from("--key-algorithm"),
+            OsString::from("ecdsa"),
+            OsString::from("--pkcs11-module"),
+            module.into_os_string(),
+            OsString::from("--dry-run"),
+        ])
+        .expect("dry run should succeed");
+
+        assert!(output.contains("transport=pkcs11"));
+        assert!(output.contains("digest_algorithm=sha256"));
+        assert!(output.contains("key_algorithm=ecdsa"));
+        assert!(!output.contains("openssl"));
+    }
+
+    #[test]
+    fn renders_ccid_transport_in_dry_run() {
         let temp = TempDir::new();
         let input = temp.write_file("document.txt", "hello");
         let cert = temp.write_file("signer.der", "certificate");
@@ -1602,19 +2017,19 @@ mod tests {
             OsString::from("--cert"),
             cert.into_os_string(),
             OsString::from("--key-uri"),
-            OsString::from("rutoken:slot=0;id=%01"),
+            OsString::from("pkcs11:slot=0;id=%01"),
             OsString::from("--transport"),
             OsString::from("ccid"),
             OsString::from("--ccid-reader"),
-            OsString::from("Rutoken"),
+            OsString::from("Alcor Micro AU9560"),
             OsString::from("--dry-run"),
         ])
         .expect("dry run should succeed");
 
         assert!(output.contains("transport=ccid"));
-        assert!(output.contains("ccid_product=Rutoken ECP"));
-        assert!(output.contains("ccid_vid=0x0a89"));
-        assert!(output.contains("ccid_pid=0x0030"));
+        assert!(output.contains("ccid_reader=Alcor Micro AU9560"));
+        assert!(!output.contains("vid="));
+        assert!(!output.contains("pid="));
     }
 
     #[test]
@@ -1634,12 +2049,141 @@ mod tests {
     }
 
     #[test]
-    fn usage_exposes_only_native_digest_names() {
+    fn sha2_digest_sizes_are_correct() {
+        assert_eq!(compute_digest(b"hello", DigestAlgorithm::Sha256).len(), 32);
+        assert_eq!(compute_digest(b"hello", DigestAlgorithm::Sha384).len(), 48);
+        assert_eq!(compute_digest(b"hello", DigestAlgorithm::Sha512).len(), 64);
+        assert_ne!(
+            compute_digest(b"hello", DigestAlgorithm::Sha256),
+            compute_digest(b"world", DigestAlgorithm::Sha256)
+        );
+    }
+
+    #[test]
+    fn sha2_digests_are_well_known_values() {
+        // SHA-256 of "abc" (known test vector from FIPS 180-4)
+        let digest = compute_digest(b"abc", DigestAlgorithm::Sha256);
+        assert_eq!(
+            digest,
+            vec![
+                0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40, 0xde, 0x5d, 0xae,
+                0x22, 0x23, 0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61,
+                0xf2, 0x00, 0x15, 0xad,
+            ]
+        );
+    }
+
+    #[test]
+    fn key_algorithm_defaults_gost_for_gost_digest() {
+        assert_eq!(
+            KeyAlgorithm::default_for_digest(DigestAlgorithm::Gost3411_2012_256),
+            KeyAlgorithm::Gost3410_2012_256
+        );
+        assert_eq!(
+            KeyAlgorithm::default_for_digest(DigestAlgorithm::Gost3411_2012_512),
+            KeyAlgorithm::Gost3410_2012_512
+        );
+    }
+
+    #[test]
+    fn key_algorithm_defaults_ecdsa_for_sha2_digest() {
+        assert_eq!(
+            KeyAlgorithm::default_for_digest(DigestAlgorithm::Sha256),
+            KeyAlgorithm::Ecdsa
+        );
+        assert_eq!(
+            KeyAlgorithm::default_for_digest(DigestAlgorithm::Sha384),
+            KeyAlgorithm::Ecdsa
+        );
+        assert_eq!(
+            KeyAlgorithm::default_for_digest(DigestAlgorithm::Sha512),
+            KeyAlgorithm::Ecdsa
+        );
+    }
+
+    #[test]
+    fn key_algorithm_produces_correct_signature_oids() {
+        // GOST
+        assert_eq!(
+            KeyAlgorithm::Gost3410_2012_256
+                .signature_oid(DigestAlgorithm::Gost3411_2012_256)
+                .expect("valid combination")
+                .to_string(),
+            "1.2.643.7.1.1.1.1"
+        );
+        // ECDSA
+        assert_eq!(
+            KeyAlgorithm::Ecdsa
+                .signature_oid(DigestAlgorithm::Sha256)
+                .expect("valid combination")
+                .to_string(),
+            "1.2.840.10045.4.3.2"
+        );
+        assert_eq!(
+            KeyAlgorithm::Ecdsa
+                .signature_oid(DigestAlgorithm::Sha384)
+                .expect("valid combination")
+                .to_string(),
+            "1.2.840.10045.4.3.3"
+        );
+        assert_eq!(
+            KeyAlgorithm::Ecdsa
+                .signature_oid(DigestAlgorithm::Sha512)
+                .expect("valid combination")
+                .to_string(),
+            "1.2.840.10045.4.3.4"
+        );
+        // RSA
+        assert_eq!(
+            KeyAlgorithm::Rsa
+                .signature_oid(DigestAlgorithm::Sha256)
+                .expect("valid combination")
+                .to_string(),
+            "1.2.840.113549.1.1.11"
+        );
+        assert_eq!(
+            KeyAlgorithm::Rsa
+                .signature_oid(DigestAlgorithm::Sha384)
+                .expect("valid combination")
+                .to_string(),
+            "1.2.840.113549.1.1.12"
+        );
+        assert_eq!(
+            KeyAlgorithm::Rsa
+                .signature_oid(DigestAlgorithm::Sha512)
+                .expect("valid combination")
+                .to_string(),
+            "1.2.840.113549.1.1.13"
+        );
+    }
+
+    #[test]
+    fn incompatible_key_algorithm_and_digest_is_rejected() {
+        assert!(matches!(
+            KeyAlgorithm::Ecdsa.signature_oid(DigestAlgorithm::Gost3411_2012_256),
+            Err(CliError::Usage(_))
+        ));
+        assert!(matches!(
+            KeyAlgorithm::Rsa.signature_oid(DigestAlgorithm::Gost3411_2012_512),
+            Err(CliError::Usage(_))
+        ));
+        assert!(matches!(
+            KeyAlgorithm::Gost3410_2012_256.signature_oid(DigestAlgorithm::Sha256),
+            Err(CliError::Usage(_))
+        ));
+    }
+
+    #[test]
+    fn usage_exposes_all_digest_names() {
         let help = run_cli([OsString::from("--help")]).expect("help should render");
 
         assert!(help.contains("gost12-256"));
         assert!(help.contains("gost12-512"));
-        assert!(!help.contains("md_gost"));
+        assert!(help.contains("sha256"));
+        assert!(help.contains("sha384"));
+        assert!(help.contains("sha512"));
+        assert!(help.contains("ecdsa"));
+        assert!(help.contains("rsa"));
         assert!(!help.to_ascii_lowercase().contains("openssl"));
     }
 
@@ -1674,6 +2218,7 @@ mod tests {
         let input = cms_envelope::CmsSigningInput::new(
             vec![1, 2, 3],
             DigestAlgorithm::Gost3411_2012_256,
+            KeyAlgorithm::Gost3410_2012_256,
             vec![1],
             true,
         );
@@ -1755,6 +2300,7 @@ mod tests {
         let input = cms_envelope::CmsSigningInput::new(
             vec![0; DigestAlgorithm::Gost3411_2012_256.output_len()],
             DigestAlgorithm::Gost3411_2012_256,
+            KeyAlgorithm::Gost3410_2012_256,
             vec![1],
             true,
         );
@@ -1945,7 +2491,7 @@ mod tests {
     #[test]
     fn ccid_signer_rejects_wrong_digest_length() {
         let config =
-            token::CcidSignerConfig::new(None, "rutoken:slot=0;id=%01".to_string(), None);
+            token::CcidSignerConfig::new(None, "rutoken:slot=0;id=%01".to_string(), None, KeyAlgorithm::Gost3410_2012_256);
 
         let error = token::TokenSigner::sign_digest(
             &config,
@@ -1959,7 +2505,7 @@ mod tests {
 
     #[test]
     fn ccid_signer_rejects_invalid_key_uri() {
-        let config = token::CcidSignerConfig::new(None, "pkcs11:id=%01".to_string(), None);
+        let config = token::CcidSignerConfig::new(None, "pkcs11:id=%01".to_string(), None, KeyAlgorithm::Gost3410_2012_256);
 
         let error = token::TokenSigner::sign_digest(
             &config,
