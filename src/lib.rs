@@ -633,8 +633,8 @@ const OID_GOST3411_2012_512: const_oid::ObjectIdentifier =
 impl DigestAlgorithm {
     pub fn parse(name: &str) -> Result<Self, CliError> {
         match name {
-            "gost3411-2012-256" | "gost12-256" | "md_gost12_256" => Ok(Self::Gost3411_2012_256),
-            "gost3411-2012-512" | "gost12-512" | "md_gost12_512" => Ok(Self::Gost3411_2012_512),
+            "gost3411-2012-256" | "gost12-256" => Ok(Self::Gost3411_2012_256),
+            "gost3411-2012-512" | "gost12-512" => Ok(Self::Gost3411_2012_512),
             _ => Err(CliError::Usage(format!(
                 "unsupported --digest {name}; expected gost12-256 or gost12-512\n\n{}",
                 usage()
@@ -1028,7 +1028,7 @@ fn usage() -> String {
          kept behind the RustCrypto cms crate boundary.\n\
          \n\
          Options:\n\
-           --digest <NAME>           gost12-256/md_gost12_256 (default) or gost12-512\n\
+           --digest <NAME>           gost12-256 (default) or gost12-512\n\
            --transport <NAME>        pkcs11 (default) or ccid\n\
            --pkcs11-module <FILE>    PKCS#11 module used by the cryptoki Rust crate\n\
            --pin-env <NAME>          Read the user PIN from an environment variable\n\
@@ -1073,7 +1073,7 @@ mod tests {
             OsString::from("--key-uri"),
             OsString::from("pkcs11:token=Signer;id=%01"),
             OsString::from("--digest"),
-            OsString::from("md_gost12_256"),
+            OsString::from("gost12-256"),
             OsString::from("--pkcs11-module"),
             module.clone().into_os_string(),
             OsString::from("--dry-run"),
@@ -1163,6 +1163,16 @@ mod tests {
             gost::hash(b"hello", DigestAlgorithm::Gost3411_2012_256),
             gost::hash(b"world", DigestAlgorithm::Gost3411_2012_256)
         );
+    }
+
+    #[test]
+    fn usage_exposes_only_native_digest_names() {
+        let help = run_cli([OsString::from("--help")]).expect("help should render");
+
+        assert!(help.contains("gost12-256"));
+        assert!(help.contains("gost12-512"));
+        assert!(!help.contains("md_gost"));
+        assert!(!help.to_ascii_lowercase().contains("openssl"));
     }
 
     #[test]
