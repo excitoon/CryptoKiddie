@@ -1,17 +1,19 @@
 # CryptoKiddie
 
-Minimal native Rust CLI for signing documents with token-backed keys through OpenSSL providers.
+Minimal native Rust CLI for building a self-contained document-signing path around token-backed GOST keys.
 
-## Why this shape
+## Direction
 
-The issue asks for an OS X/Linux/Windows native tool and explicitly raises the OpenSSL-provider question. This repository now ships a small Rust binary that keeps the UX native while delegating the actual token access to OpenSSL 3 providers (for example `pkcs11`) configured for PKCS#11-backed keys.
+The signing path is being rewritten away from the OpenSSL-provider wrapper. The new Rust boundary is:
 
-That gives us:
+- hash document bytes in-process with `ГОСТ Р 34.11-2012` via the RustCrypto `streebog` crate;
+- ask the token hardware to sign the digest with `ГОСТ Р 34.10-2012 с ключом 256`;
+- construct the CMS/PKCS#7 `SignedData` envelope through Rust CMS code rather than shelling out to OpenSSL;
+- support two token transports:
+  - `pkcs11`, using the Rust `pkcs11` crate against a supplied PKCS#11 module while the module replacement is developed;
+  - `ccid`, the direct USB/CCID APDU protocol boundary for replacing vendor driver behavior.
 
-- a single cross-platform Rust executable;
-- no private-key export from the token;
-- compatibility with provider-based integrations instead of hard-coding one token SDK;
-- app-local provider/module wiring, so the tool does not depend on a system-wide token stack installation.
+The target USB token profile discussed for this workflow is `Rutoken ECP (Рутокен ЭЦП 3.0)` from Aktiv, exposed on USB as VID `0x0a89` / PID `0x0030`.
 
 ## Usage
 
@@ -19,25 +21,31 @@ That gives us:
 cargo run -- sign \
   --input contract.pdf \
   --output contract.pdf.p7s \
-  --cert signer.pem \
+  --cert signer.der \
   --key-uri 'pkcs11:token=Signer;id=%01' \
-  --digest md_gost12_256 \
-  --provider-path ./ossl-modules \
-  --pkcs11-module ./pkcs11-module.so \
+  --digest gost12-256 \
+  --pkcs11-module ./librtpkcs11ecp.so \
   --dry-run
 ```
 
-Remove `--dry-run` to execute `openssl cms -sign`.
+For direct USB/CCID bring-up:
 
-## Notes
+```bash
+cargo run -- sign \
+  --input contract.pdf \
+  --output contract.pdf.p7s \
+  --cert signer.der \
+  --key-uri 'rutoken:slot=0;id=%01' \
+  --transport ccid \
+  --ccid-reader Rutoken \
+  --dry-run
+```
 
-- The private key is expected to stay on the token and be referenced by `--key-uri`.
-- The signer certificate is provided as a PEM file via `--cert`.
-- `--digest` selects the OpenSSL hash/digest name passed as `-md`.
-- For `ГОСТ Р 34.10-2012` with a 256-bit key, use `--digest md_gost12_256`, which is the OpenSSL name for `ГОСТ Р 34.11-2012` 256-bit.
-- For `ГОСТ Р 34.11-2012` 512-bit hashing, use `--digest md_gost12_512`.
-- The target USB token profile discussed for this workflow is `Rutoken ECP (Рутокен ЭЦП 3.0)` from Aktiv, exposed on USB as VID `0x0a89` / PID `0x0030`.
-- `--provider-path` can point at an application-bundled OpenSSL provider directory instead of relying on a system install.
-- `--pkcs11-module` maps directly to `PKCS11_PROVIDER_MODULE`, so the token driver can live next to the app instead of being registered system-wide.
-- The concrete PKCS#11 module path is deployment-specific and supplied explicitly with `--pkcs11-module`; the CLI does not hard-code any vendor library names.
-- `--provider-config` remains available as an escape hatch for advanced provider settings that are not yet modeled directly in the CLI.
+`--dry-run` hashes the input and prints the native signing plan without producing a signature.
+
+## Current status
+
+- The OpenSSL command execution path has been removed.
+- `ГОСТ Р 34.11-2012` hashing is implemented in Rust through `streebog` for 256-bit and 512-bit variants (`gost12-256`, `gost12-512`, plus the OpenSSL-compatible aliases `md_gost12_256` and `md_gost12_512`).
+- CMS construction, PKCS#11 signing, and direct USB/CCID signing are now explicit Rust module boundaries with unit coverage.
+- Live Rutoken signing and complete `librtpkcs11ecp` replacement still require hardware-backed mechanism/APDU validation before the CLI can safely emit a final CMS signature.
