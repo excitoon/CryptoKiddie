@@ -379,7 +379,7 @@ mod tests {
         .expect("command should parse");
 
         assert_eq!(command.provider, "pkcs11");
-        assert_eq!(command.openssl_bin, PathBuf::from("openssl"));
+        assert_eq!(command.openssl_bin, super::default_openssl_binary());
         assert!(!command.embed_content);
         assert!(!command.dry_run);
         assert!(command.extra_args.is_empty());
