@@ -214,14 +214,14 @@ impl SignCommand {
     }
 
     pub fn render_command(&self) -> String {
-        let mut lines = self.render_environment();
+        let mut output_lines = self.render_environment();
         let mut rendered = shell_quote(self.openssl_bin.as_os_str().to_string_lossy().as_ref());
         for arg in self.openssl_args() {
             rendered.push(' ');
             rendered.push_str(&shell_quote(arg.to_string_lossy().as_ref()));
         }
-        lines.push(rendered);
-        lines.join("\n")
+        output_lines.push(rendered);
+        output_lines.join("\n")
     }
 
     pub fn run(&self) -> Result<String, CliError> {
@@ -266,7 +266,7 @@ impl SignCommand {
         if let Some(pkcs11_module) = &self.pkcs11_module {
             environment.push((
                 "PKCS11_PROVIDER_MODULE",
-                pkcs11_module.clone().into_os_string(),
+                pkcs11_module.as_os_str().to_os_string(),
             ));
         }
 
@@ -458,8 +458,10 @@ mod tests {
         ])
         .expect("command should parse");
 
+        assert_eq!(command.pkcs11_module.as_deref(), Some(module.as_path()));
         let rendered = command.render_command();
         assert!(rendered.contains("PKCS11_PROVIDER_MODULE="));
+        assert!(rendered.contains(module.to_string_lossy().as_ref()));
         assert!(rendered.contains("-provider legacy-pkcs11"));
         assert!(rendered.contains("-provider-path"));
         assert!(rendered.contains("-config"));
