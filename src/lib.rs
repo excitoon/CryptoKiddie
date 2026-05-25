@@ -256,7 +256,7 @@ pub mod token {
     }
 
     pub fn pkcs11_crate_backend() -> &'static str {
-        std::any::type_name::<pkcs11::Ctx>()
+        std::any::type_name::<cryptoki::context::Pkcs11>()
     }
 
     pub trait TokenSigner {
@@ -282,7 +282,7 @@ pub mod token {
                     digest.len()
                 )));
             }
-            let _ctx = pkcs11::Ctx::new(&self.module).map_err(|error| {
+            let _ctx = cryptoki::context::Pkcs11::new(&self.module).map_err(|error| {
                 CliError::Message(format!(
                     "failed to load PKCS#11 module {}: {error}",
                     self.module.display()
@@ -701,13 +701,13 @@ fn usage() -> String {
          Options:\n\
            --digest <NAME>           gost12-256/md_gost12_256 (default) or gost12-512\n\
            --transport <NAME>        pkcs11 (default) or ccid\n\
-           --pkcs11-module <FILE>    PKCS#11 module used by the pkcs11 Rust crate\n\
+           --pkcs11-module <FILE>    PKCS#11 module used by the cryptoki Rust crate\n\
            --ccid-reader <NAME>      CCID reader selector for direct USB/APDU work\n\
            --embed-content           Produce an attached CMS object after signing\n\
            --dry-run                 Hash input and print the native signing plan\n\
          \n\
          Example:\n\
-           cryptokiddie sign --input contract.pdf --output contract.pdf.p7s \\\n             --cert signer.der --key-uri pkcs11:token=Signer;id=%01 \\\n             --digest gost12-256 --pkcs11-module ./librtpkcs11ecp.so --dry-run\n",
+           cryptokiddie sign --input contract.pdf --output contract.pdf.p7s \\\n             --cert signer.der --key-uri pkcs11:token=Signer;id=%01 \\\n             --digest gost12-256 --pkcs11-module ./opensc-pkcs11.so --dry-run\n",
     )
 }
 
@@ -780,7 +780,7 @@ mod tests {
         assert!(output.contains("native signing plan"));
         assert!(output.contains("transport=pkcs11"));
         assert!(output.contains("digest_algorithm=gost12-256"));
-        assert!(output.contains("pkcs11_backend=pkcs11::Ctx"));
+        assert!(output.contains("pkcs11_backend=cryptoki::context::Pkcs11"));
         assert!(output.contains("cms_backend=cms::content_info::ContentInfo"));
         assert!(!output.contains("openssl"));
     }
