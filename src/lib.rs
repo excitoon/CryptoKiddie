@@ -554,13 +554,10 @@ pub mod token {
     }
 
     fn gost3410_mechanism() -> Mechanism<'static> {
-        assert_eq!(
-            std::mem::size_of::<cryptoki_sys::CK_MECHANISM_TYPE>(),
-            std::mem::size_of::<MechanismType>()
-        );
+        const _: [(); std::mem::size_of::<cryptoki_sys::CK_MECHANISM_TYPE>()] =
+            [(); std::mem::size_of::<MechanismType>()];
         let mechanism_type = unsafe {
-            // CKM_GOSTR3410 is present in cryptoki-sys but not yet modelled by cryptoki's safe
-            // Mechanism enum; MechanismType is the crate's transparent newtype over CK_MECHANISM_TYPE.
+            // cryptoki 0.12 exposes CKM_GOSTR3410 through cryptoki-sys, but not its safe Mechanism enum.
             std::mem::transmute::<cryptoki_sys::CK_MECHANISM_TYPE, MechanismType>(CKM_GOSTR3410)
         };
         Mechanism::VendorDefined(VendorDefinedMechanism::new::<()>(mechanism_type, None))
@@ -587,7 +584,7 @@ pub mod token {
         let mut index = 0;
         while index < bytes.len() {
             if bytes[index] == b'%' {
-                if index + 3 > bytes.len() {
+                if index + 2 >= bytes.len() {
                     return Err(CliError::Usage(format!(
                         "invalid percent escape in PKCS#11 URI: {value}"
                     )));
