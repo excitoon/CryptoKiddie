@@ -13,6 +13,7 @@ pub struct SignCommand {
     pub cert: PathBuf,
     pub key_uri: String,
     pub provider: String,
+    pub pkcs11_module: Option<PathBuf>,
     pub provider_path: Option<PathBuf>,
     pub provider_config: Option<PathBuf>,
     pub openssl_bin: PathBuf,
@@ -73,6 +74,7 @@ impl SignCommand {
         let mut cert = None;
         let mut key_uri = None;
         let mut provider = String::from("pkcs11");
+        let mut pkcs11_module = None;
         let mut provider_path = None;
         let mut provider_config = None;
         let mut openssl_bin = default_openssl_binary();
@@ -93,6 +95,9 @@ impl SignCommand {
                     provider = next_value(&mut iter, "--provider")?
                         .to_string_lossy()
                         .into()
+                }
+                "--pkcs11-module" => {
+                    pkcs11_module = Some(PathBuf::from(next_value(&mut iter, "--pkcs11-module")?))
                 }
                 "--provider-path" => {
                     provider_path = Some(PathBuf::from(next_value(&mut iter, "--provider-path")?))
@@ -124,6 +129,7 @@ impl SignCommand {
             cert: required_path(cert, "--cert")?,
             key_uri: required_string(key_uri, "--key-uri")?,
             provider,
+            pkcs11_module,
             provider_path,
             provider_config,
             openssl_bin,
@@ -140,6 +146,10 @@ impl SignCommand {
         ensure_file_exists(&self.input, "--input")?;
         ensure_parent_exists(&self.output, "--output")?;
         ensure_file_exists(&self.cert, "--cert")?;
+
+        if let Some(pkcs11_module) = &self.pkcs11_module {
+            ensure_file_exists(pkcs11_module, "--pkcs11-module")?;
+        }
 
         if let Some(provider_path) = &self.provider_path {
             ensure_dir_exists(provider_path, "--provider-path")?;
@@ -204,12 +214,14 @@ impl SignCommand {
     }
 
     pub fn render_command(&self) -> String {
+        let mut lines = self.render_environment();
         let mut rendered = shell_quote(self.openssl_bin.as_os_str().to_string_lossy().as_ref());
         for arg in self.openssl_args() {
             rendered.push(' ');
             rendered.push_str(&shell_quote(arg.to_string_lossy().as_ref()));
         }
-        rendered
+        lines.push(rendered);
+        lines.join("\n")
     }
 
     pub fn run(&self) -> Result<String, CliError> {
@@ -217,15 +229,18 @@ impl SignCommand {
             return Ok(self.render_command());
         }
 
-        let output = Command::new(&self.openssl_bin)
-            .args(self.openssl_args())
-            .output()
-            .map_err(|error| {
-                CliError::Message(format!(
-                    "failed to execute {}: {error}",
-                    self.openssl_bin.display()
-                ))
-            })?;
+        let mut command = Command::new(&self.openssl_bin);
+        command.args(self.openssl_args());
+        for (name, value) in self.environment() {
+            command.env(name, value);
+        }
+
+        let output = command.output().map_err(|error| {
+            CliError::Message(format!(
+                "failed to execute {}: {error}",
+                self.openssl_bin.display()
+            ))
+        })?;
 
         if output.status.success() {
             Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
@@ -243,6 +258,28 @@ impl SignCommand {
             }
             Err(CliError::Message(message))
         }
+    }
+
+    fn environment(&self) -> Vec<(&'static str, OsString)> {
+        let mut environment = Vec::new();
+
+        if let Some(pkcs11_module) = &self.pkcs11_module {
+            environment.push((
+                "PKCS11_PROVIDER_MODULE",
+                pkcs11_module.clone().into_os_string(),
+            ));
+        }
+
+        environment
+    }
+
+    fn render_environment(&self) -> Vec<String> {
+        self.environment()
+            .into_iter()
+            .map(|(name, value)| {
+                format!("{name}={}", shell_quote(value.to_string_lossy().as_ref()))
+            })
+            .collect()
     }
 }
 
@@ -334,8 +371,9 @@ fn usage() -> String {
          \n\
          Options:\n\
            --provider <NAME>         OpenSSL provider name (default: pkcs11)\n\
+           --pkcs11-module <FILE>    PKCS#11 driver to use via PKCS11_PROVIDER_MODULE\n\
            --provider-path <DIR>     OpenSSL provider search path\n\
-           --provider-config <FILE>  OpenSSL config that wires the provider to the token module\n\
+           --provider-config <FILE>  Extra OpenSSL config for advanced provider settings\n\
            --openssl <PATH>          OpenSSL binary to execute (default: openssl / openssl.exe)\n\
            --embed-content           Produce an attached CMS object (-nodetach)\n\
            --dry-run                 Print the OpenSSL command instead of executing it\n\
@@ -344,7 +382,7 @@ fn usage() -> String {
          Example:\n\
            cryptokiddie sign --input contract.pdf --output contract.pdf.p7s \\\n\
              --cert signer.pem --key-uri pkcs11:token=Signer;id=%01 \\\n\
-             --provider-config openssl-pkcs11.cnf --dry-run\n",
+             --pkcs11-module ./crypto-pro-pkcs11.so --dry-run\n",
     )
 }
 
@@ -379,6 +417,7 @@ mod tests {
         .expect("command should parse");
 
         assert_eq!(command.provider, "pkcs11");
+        assert_eq!(command.pkcs11_module, None);
         assert_eq!(command.openssl_bin, super::default_openssl_binary());
         assert!(!command.embed_content);
         assert!(!command.dry_run);
@@ -391,6 +430,7 @@ mod tests {
         let input = temp.write_file("document.txt", "hello");
         let cert = temp.write_file("signer.pem", "-----BEGIN CERTIFICATE-----");
         let config = temp.write_file("openssl.cnf", "[openssl_init]");
+        let module = temp.write_file("crypto-pro-pkcs11.so", "driver");
         let providers = temp.create_dir("providers");
         let output = temp.path().join("document.txt.p7s");
 
@@ -405,6 +445,8 @@ mod tests {
             OsString::from("pkcs11:token=Signer;id=%01"),
             OsString::from("--provider"),
             OsString::from("legacy-pkcs11"),
+            OsString::from("--pkcs11-module"),
+            module.clone().into_os_string(),
             OsString::from("--provider-path"),
             providers.clone().into_os_string(),
             OsString::from("--provider-config"),
@@ -417,6 +459,7 @@ mod tests {
         .expect("command should parse");
 
         let rendered = command.render_command();
+        assert!(rendered.contains("PKCS11_PROVIDER_MODULE="));
         assert!(rendered.contains("-provider legacy-pkcs11"));
         assert!(rendered.contains("-provider-path"));
         assert!(rendered.contains("-config"));
@@ -453,6 +496,7 @@ mod tests {
         let temp = TempDir::new();
         let input = temp.write_file("document.txt", "hello");
         let cert = temp.write_file("signer.pem", "-----BEGIN CERTIFICATE-----");
+        let module = temp.write_file("crypto-pro-pkcs11.so", "driver");
         let output = temp.path().join("document.txt.p7s");
 
         let output = run_cli([
@@ -465,11 +509,14 @@ mod tests {
             cert.into_os_string(),
             OsString::from("--key-uri"),
             OsString::from("pkcs11:token=Signer;id=%01"),
+            OsString::from("--pkcs11-module"),
+            module.into_os_string(),
             OsString::from("--dry-run"),
         ])
         .expect("dry run should succeed");
 
-        assert!(output.starts_with("openssl cms -sign -binary"));
+        assert!(output.contains("PKCS11_PROVIDER_MODULE="));
+        assert!(output.contains("\nopenssl cms -sign -binary"));
     }
 
     struct TempDir {
