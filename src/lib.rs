@@ -1,6 +1,7 @@
 use std::{
     ffi::OsString,
-    fmt, fs,
+    fmt::{self, Write as _},
+    fs,
     path::{Path, PathBuf},
 };
 
@@ -578,14 +579,17 @@ impl SignCommand {
         }
 
         match self.transport {
-            Transport::Pkcs11 => token::Pkcs11SignerConfig::new(
-                self.pkcs11_module.clone().expect("validated module"),
-                self.key_uri.clone(),
-            )
-            .sign_digest(self.digest, &digest),
+            Transport::Pkcs11 => {
+                let signer = token::Pkcs11SignerConfig::new(
+                    self.pkcs11_module.clone().expect("validated module"),
+                    self.key_uri.clone(),
+                );
+                token::TokenSigner::sign_digest(&signer, self.digest, &digest)
+            }
             Transport::Ccid => {
-                token::CcidSignerConfig::new(self.ccid_reader.clone(), self.key_uri.clone())
-                    .sign_digest(self.digest, &digest)
+                let signer =
+                    token::CcidSignerConfig::new(self.ccid_reader.clone(), self.key_uri.clone());
+                token::TokenSigner::sign_digest(&signer, self.digest, &digest)
             }
         }?;
 
@@ -634,27 +638,6 @@ impl SignCommand {
     }
 }
 
-trait SignDigestExt {
-    fn sign_digest(
-        &self,
-        digest_algorithm: DigestAlgorithm,
-        digest: &[u8],
-    ) -> Result<Vec<u8>, CliError>;
-}
-
-impl<T> SignDigestExt for T
-where
-    T: token::TokenSigner,
-{
-    fn sign_digest(
-        &self,
-        digest_algorithm: DigestAlgorithm,
-        digest: &[u8],
-    ) -> Result<Vec<u8>, CliError> {
-        token::TokenSigner::sign_digest(self, digest_algorithm, digest)
-    }
-}
-
 fn next_value<I>(iter: &mut I, flag: &str) -> Result<OsString, CliError>
 where
     I: Iterator<Item = OsString>,
@@ -699,11 +682,9 @@ fn ensure_parent_exists(path: &Path, flag: &str) -> Result<(), CliError> {
 
 fn hex_encode(bytes: &[u8]) -> String {
     // Keep this tiny diagnostic encoder local instead of adding another dependency.
-    const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut output = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
-        output.push(HEX[(byte >> 4) as usize] as char);
-        output.push(HEX[(byte & 0x0f) as usize] as char);
+        let _ = write!(output, "{byte:02x}");
     }
     output
 }
@@ -726,7 +707,7 @@ fn usage() -> String {
            --dry-run                 Hash input and print the native signing plan\n\
          \n\
          Example:\n\
-           cryptokiddie sign --input contract.pdf --output contract.pdf.p7s \\\n             --cert signer.pem --key-uri pkcs11:token=Signer;id=%01 \\\n             --digest gost12-256 --pkcs11-module ./librtpkcs11ecp.so --dry-run\n",
+           cryptokiddie sign --input contract.pdf --output contract.pdf.p7s \\\n             --cert signer.der --key-uri pkcs11:token=Signer;id=%01 \\\n             --digest gost12-256 --pkcs11-module ./librtpkcs11ecp.so --dry-run\n",
     )
 }
 
