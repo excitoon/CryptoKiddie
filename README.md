@@ -50,4 +50,9 @@ cargo run -- sign \
 - The OpenSSL command execution path has been removed.
 - `ГОСТ Р 34.11-2012` hashing is implemented in Rust through `streebog` for 256-bit and 512-bit variants (`gost12-256`, `gost12-512`).
 - CMS construction and PKCS#11 signing are wired into the non-dry-run path: the CLI hashes the input, opens a token session with `cryptoki`, signs with the token's `CKM_GOSTR3410` mechanism, builds CMS `SignedData`, and writes DER `.p7s` output.
-- Direct USB/CCID signing and complete proprietary PKCS#11 driver replacement still require hardware-backed mechanism/APDU validation before the CLI can safely use that transport for final signatures.
+- Direct USB/CCID signing is implemented and replaces the proprietary PKCS#11 driver dependency:
+  - `ccid::CcidDevice` discovers the Rutoken ECP by VID/PID (`0x0a89`/`0x0030`), claims the CCID interface (bInterfaceClass `0x0B`), and communicates via USB bulk transfer.
+  - `ccid::IccPowerOn` / `ccid::RdrDataBlock` encode/decode the CCID `PC_to_RDR_IccPowerOn` and `RDR_to_PC_DataBlock` messages.
+  - `rutoken::RutokenUri` parses `rutoken:slot=N;id=%XX` key URIs used with `--transport ccid`.
+  - The ISO 7816-8 APDU sequence (SELECT MF → VERIFY PIN → MSE SET → PSO COMPUTE DIGITAL SIGNATURE) is implemented in the `rutoken` module against OpenSC's `card-rutokenecp.c` as reference.
+  - Hardware-in-the-loop testing requires a physical Rutoken ECP 3.0 device and appropriate USB access permissions.
