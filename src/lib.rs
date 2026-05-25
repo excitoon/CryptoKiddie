@@ -521,6 +521,37 @@ mod tests {
         assert!(output.contains("\nopenssl cms -sign -binary"));
     }
 
+    #[test]
+    fn pkcs11_module_sets_process_environment() {
+        let temp = TempDir::new();
+        let input = temp.write_file("document.txt", "hello");
+        let cert = temp.write_file("signer.pem", "-----BEGIN CERTIFICATE-----");
+        let module = temp.write_file("crypto-pro-pkcs11.so", "driver");
+        let output = temp.path().join("document.txt.p7s");
+
+        let command = SignCommand::parse([
+            OsString::from("--input"),
+            input.into_os_string(),
+            OsString::from("--output"),
+            output.into_os_string(),
+            OsString::from("--cert"),
+            cert.into_os_string(),
+            OsString::from("--key-uri"),
+            OsString::from("pkcs11:token=Signer;id=%01"),
+            OsString::from("--pkcs11-module"),
+            module.clone().into_os_string(),
+        ])
+        .expect("command should parse");
+
+        assert_eq!(
+            command.environment(),
+            vec![(
+                "PKCS11_PROVIDER_MODULE",
+                module.as_os_str().to_os_string(),
+            )]
+        );
+    }
+
     struct TempDir {
         path: PathBuf,
     }
