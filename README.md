@@ -1,53 +1,95 @@
 # CryptoKiddie
 
-Minimal native Rust CLI for building a self-contained document-signing path around token-backed GOST keys without an OpenSSL dependency.
+Minimal native Rust CLI for building a self-contained document-signing path around token-backed cryptographic keys without an OpenSSL dependency.
 
 ## Direction
 
 The signing path is native Rust plus token hardware. It does not shell out to OpenSSL or rely on OpenSSL provider configuration:
 
-- hash document bytes in-process with `ГОСТ Р 34.11-2012` via the RustCrypto `streebog` crate;
-- ask the token hardware to sign the digest with `ГОСТ Р 34.10-2012 с ключом 256`;
+- hash document bytes in-process via RustCrypto crates:
+  - `ГОСТ Р 34.11-2012` (256-bit or 512-bit) via the `streebog` crate;
+  - SHA-256, SHA-384, or SHA-512 via the `sha2` crate;
+- ask the token hardware to sign the digest using the configured key algorithm:
+  - `ГОСТ Р 34.10-2012` via `CKM_GOSTR3410` (PKCS#11);
+  - ECDSA via `CKM_ECDSA` (PKCS#11);
+  - RSA PKCS#1 v1.5 via `CKM_RSA_PKCS` with automatic DigestInfo wrapping (PKCS#11);
 - construct the CMS/PKCS#7 `SignedData` envelope through Rust CMS code rather than shelling out to OpenSSL;
 - support two token transports:
-  - `pkcs11`, using the Rust `cryptoki` crate against a supplied PKCS#11 module while the module replacement is developed;
+  - `pkcs11`, using the Rust `cryptoki` crate against any supplied PKCS#11 module;
   - `ccid`, the direct USB/CCID APDU protocol boundary for replacing vendor driver behavior.
-
-The target USB token profile discussed for this workflow is `Rutoken ECP (Рутокен ЭЦП 3.0)` from Aktiv, exposed on USB as VID `0x0a89` / PID `0x0030`.
-OpenSC's `card-rutokenecp.c` / `opensc-pkcs11` and AktivCo/OpenSC are the open-source reference points for replacing the proprietary PKCS#11 driver behavior.
 
 ## Usage
 
 ```bash
+# ECDSA with SHA-256 (any PKCS#11 token with an ECDSA key)
+cargo run -- sign \
+  --input contract.pdf \
+  --output contract.pdf.p7s \
+  --cert signer.der \
+  --key-uri 'pkcs11:token=Signer;id=%01' \
+  --digest sha256 \
+  --key-algorithm ecdsa \
+  --pkcs11-module ./opensc-pkcs11.so \
+  --pin-env TOKEN_PIN \
+  --dry-run
+
+# RSA with SHA-256
+cargo run -- sign \
+  --input contract.pdf \
+  --output contract.pdf.p7s \
+  --cert signer.der \
+  --key-uri 'pkcs11:token=Signer;id=%01' \
+  --digest sha256 \
+  --key-algorithm rsa \
+  --pkcs11-module ./opensc-pkcs11.so \
+  --pin-env TOKEN_PIN \
+  --dry-run
+
+# GOST 34.10-2012 with 256-bit key (Rutoken ECP or any GOST-capable token)
 cargo run -- sign \
   --input contract.pdf \
   --output contract.pdf.p7s \
   --cert signer.der \
   --key-uri 'pkcs11:token=Signer;id=%01' \
   --digest gost12-256 \
-  --pkcs11-module ./opensc-pkcs11.so \
+  --pkcs11-module ./rutoken-pkcs11.so \
   --pin-env RUTOKEN_PIN \
   --dry-run
 ```
 
-For direct USB/CCID bring-up:
+For direct USB/CCID bring-up (any CCID-compatible reader):
 
 ```bash
 cargo run -- sign \
   --input contract.pdf \
   --output contract.pdf.p7s \
   --cert signer.der \
-  --key-uri 'rutoken:slot=0;id=%01' \
+  --key-uri 'pkcs11:slot=0;id=%01' \
   --transport ccid \
-  --ccid-reader Rutoken \
+  --ccid-reader "Alcor Micro AU9560" \
   --dry-run
 ```
 
 `--dry-run` hashes the input and prints the native signing plan without producing a signature.
 
+### Supported algorithms
+
+| `--digest`    | `--key-algorithm`     | Signing OID                  |
+|---------------|-----------------------|------------------------------|
+| `gost12-256`  | `gost3410-2012-256`   | 1.2.643.7.1.1.1.1            |
+| `gost12-512`  | `gost3410-2012-512`   | 1.2.643.7.1.1.1.2            |
+| `sha256`      | `ecdsa`               | 1.2.840.10045.4.3.2          |
+| `sha384`      | `ecdsa`               | 1.2.840.10045.4.3.3          |
+| `sha512`      | `ecdsa`               | 1.2.840.10045.4.3.4          |
+| `sha256`      | `rsa`                 | 1.2.840.113549.1.1.11        |
+| `sha384`      | `rsa`                 | 1.2.840.113549.1.1.12        |
+| `sha512`      | `rsa`                 | 1.2.840.113549.1.1.13        |
+
+When `--key-algorithm` is omitted, GOST digests default to `gost3410-2012-256`/`gost3410-2012-512` and SHA-2 digests default to `ecdsa`.
+
 ## Current status
 
 - The OpenSSL command execution path has been removed.
-- `ГОСТ Р 34.11-2012` hashing is implemented in Rust through `streebog` for 256-bit and 512-bit variants (`gost12-256`, `gost12-512`).
-- CMS construction and PKCS#11 signing are wired into the non-dry-run path: the CLI hashes the input, opens a token session with `cryptoki`, signs with the token's `CKM_GOSTR3410` mechanism, builds CMS `SignedData`, and writes DER `.p7s` output.
-- Direct USB/CCID signing and complete proprietary PKCS#11 driver replacement still require hardware-backed mechanism/APDU validation before the CLI can safely use that transport for final signatures.
+- All hashing is implemented in Rust: `ГОСТ Р 34.11-2012` through `streebog`, SHA-256/384/512 through `sha2`.
+- CMS construction and PKCS#11 signing are wired into the non-dry-run path: the CLI hashes the input, opens a token session with `cryptoki`, signs with the token's chosen mechanism (`CKM_GOSTR3410`, `CKM_ECDSA`, or `CKM_RSA_PKCS`), builds CMS `SignedData`, and writes DER `.p7s` output.
+- Direct USB/CCID signing still requires hardware-backed mechanism/APDU validation before the CLI can safely use that transport for final signatures.
