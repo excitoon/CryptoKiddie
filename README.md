@@ -10,7 +10,7 @@ The signing path is native Rust plus token hardware. It does not shell out to Op
   - `ГОСТ Р 34.11-2012` (256-bit or 512-bit) via the `streebog` crate;
   - SHA-256, SHA-384, or SHA-512 via the `sha2` crate;
 - ask the token hardware to sign the digest using the configured key algorithm:
-  - `ГОСТ Р 34.10-2012` via `CKM_GOSTR3410` (PKCS#11);
+  - `ГОСТ Р 34.10-2012` via `CKM_GOSTR3410` (PKCS#11), including Rutoken devices through their PKCS#11 module;
   - ECDSA via `CKM_ECDSA` (PKCS#11);
   - RSA PKCS#1 v1.5 via `CKM_RSA_PKCS` with automatic DigestInfo wrapping (PKCS#11);
 - construct the CMS/PKCS#7 `SignedData` envelope through Rust CMS code rather than shelling out to OpenSSL;
@@ -45,7 +45,7 @@ cargo run -- sign \
   --pin-env TOKEN_PIN \
   --dry-run
 
-# GOST 34.10-2012 with 256-bit key (any GOST-capable PKCS#11 token)
+# GOST 34.10-2012 with 256-bit key (any GOST-capable PKCS#11 token, including Rutoken)
 cargo run -- sign \
   --input contract.pdf \
   --output contract.pdf.p7s \
@@ -85,7 +85,7 @@ cargo run -- sign \
 | `sha384`      | `rsa`                 | 1.2.840.113549.1.1.12        |
 | `sha512`      | `rsa`                 | 1.2.840.113549.1.1.13        |
 
-When `--key-algorithm` is omitted, GOST digests default to `gost3410-2012-256`/`gost3410-2012-512` and SHA-2 digests default to `ecdsa`.
+When `--key-algorithm` is omitted, GOST digests default to `gost3410-2012-256`/`gost3410-2012-512` and SHA-2 digests default to `ecdsa`. Rutoken/GOST support is preserved through the generic PKCS#11 path; Rutoken USB identifiers are not hard-coded into the universal CCID dry-run output.
 
 ## Current status
 
