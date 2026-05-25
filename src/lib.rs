@@ -171,12 +171,12 @@ impl SignCommand {
             ));
         }
 
-        if let Some(digest) = &self.digest
-            && digest.trim().is_empty()
-        {
-            return Err(CliError::Usage(
-                String::from("--digest must not be empty\n\n") + &usage(),
-            ));
+        if let Some(digest) = &self.digest {
+            if digest.trim().is_empty() {
+                return Err(CliError::Usage(
+                    String::from("--digest must not be empty\n\n") + &usage(),
+                ));
+            }
         }
 
         if self.provider.trim().is_empty() {
@@ -442,13 +442,15 @@ mod tests {
         assert_eq!(command.digest, None);
         assert_eq!(command.pkcs11_module, None);
         assert_eq!(command.openssl_bin, super::default_openssl_binary());
+        let rendered = command.render_command();
+        assert!(!rendered.contains("-md "));
         assert!(!command.embed_content);
         assert!(!command.dry_run);
         assert!(command.extra_args.is_empty());
     }
 
     #[test]
-    fn renders_provider_configuration_digest_and_passthrough_arguments() {
+    fn renders_provider_configuration_and_digest_option() {
         let temp = TempDir::new();
         let input = temp.write_file("document.txt", "hello");
         let cert = temp.write_file("signer.pem", "-----BEGIN CERTIFICATE-----");
@@ -477,9 +479,6 @@ mod tests {
             OsString::from("--provider-config"),
             config.clone().into_os_string(),
             OsString::from("--embed-content"),
-            OsString::from("--"),
-            OsString::from("-md"),
-            OsString::from("sha256"),
         ])
         .expect("command should parse");
 
@@ -492,7 +491,32 @@ mod tests {
         assert!(rendered.contains("-config"));
         assert!(rendered.contains("-md md_gost12_256"));
         assert!(rendered.contains("-nodetach"));
-        assert!(rendered.contains("-binary -in"));
+    }
+
+    #[test]
+    fn renders_passthrough_arguments_without_digest_option() {
+        let temp = TempDir::new();
+        let input = temp.write_file("document.txt", "hello");
+        let cert = temp.write_file("signer.pem", "-----BEGIN CERTIFICATE-----");
+        let output = temp.path().join("document.txt.p7s");
+
+        let command = SignCommand::parse([
+            OsString::from("--input"),
+            input.into_os_string(),
+            OsString::from("--output"),
+            output.into_os_string(),
+            OsString::from("--cert"),
+            cert.into_os_string(),
+            OsString::from("--key-uri"),
+            OsString::from("pkcs11:token=Signer;id=%01"),
+            OsString::from("--"),
+            OsString::from("-md"),
+            OsString::from("sha256"),
+        ])
+        .expect("command should parse");
+
+        let rendered = command.render_command();
+        assert!(rendered.contains("-md sha256"));
     }
 
     #[test]
