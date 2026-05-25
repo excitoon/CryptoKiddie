@@ -387,10 +387,11 @@ fn usage() -> String {
          \n\
          Minimal native Rust wrapper around OpenSSL CMS signing for token-backed keys.\n\
          The private key stays on the token; the certificate is provided as a PEM file.\n\
-         Works with PKCS#11-backed tokens such as Рутокен ЭЦП 3.0.\n\
+         Works with PKCS#11-backed keys and provider-based OpenSSL setups.\n\
          \n\
          Options:\n\
-           --digest <NAME>           Digest to pass as -md (for example md_gost12_256)\n\
+           --digest <NAME>           Hash/digest to pass as -md (for example md_gost12_256\n\
+                                     for ГОСТ Р 34.11-2012 256-bit or md_gost12_512)\n\
            --provider <NAME>         OpenSSL provider name (default: pkcs11)\n\
            --pkcs11-module <FILE>    PKCS#11 driver to use via PKCS11_PROVIDER_MODULE\n\
            --provider-path <DIR>     OpenSSL provider search path\n\
@@ -404,7 +405,7 @@ fn usage() -> String {
            cryptokiddie sign --input contract.pdf --output contract.pdf.p7s \\\n\
              --cert signer.pem --key-uri pkcs11:token=Signer;id=%01 \\\n\
              --digest md_gost12_256 \\\n\
-             --pkcs11-module ./librtpkcs11ecp.so --dry-run\n",
+             --pkcs11-module ./pkcs11-module.so --dry-run\n",
     )
 }
 
@@ -455,7 +456,7 @@ mod tests {
         let input = temp.write_file("document.txt", "hello");
         let cert = temp.write_file("signer.pem", "-----BEGIN CERTIFICATE-----");
         let config = temp.write_file("openssl.cnf", "[openssl_init]");
-        let module = temp.write_file("reference implementation-pkcs11.so", "driver");
+        let module = temp.write_file("pkcs11-module.so", "driver");
         let providers = temp.create_dir("providers");
         let output = temp.path().join("document.txt.p7s");
 
@@ -548,7 +549,7 @@ mod tests {
         let temp = TempDir::new();
         let input = temp.write_file("document.txt", "hello");
         let cert = temp.write_file("signer.pem", "-----BEGIN CERTIFICATE-----");
-        let module = temp.write_file("reference implementation-pkcs11.so", "driver");
+        let module = temp.write_file("pkcs11-module.so", "driver");
         let output = temp.path().join("document.txt.p7s");
 
         let output = run_cli([
@@ -579,7 +580,7 @@ mod tests {
         let temp = TempDir::new();
         let input = temp.write_file("document.txt", "hello");
         let cert = temp.write_file("signer.pem", "-----BEGIN CERTIFICATE-----");
-        let module = temp.write_file("reference implementation-pkcs11.so", "driver");
+        let module = temp.write_file("pkcs11-module.so", "driver");
         let output = temp.path().join("document.txt.p7s");
 
         let command = SignCommand::parse([

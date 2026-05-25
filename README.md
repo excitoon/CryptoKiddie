@@ -4,14 +4,14 @@ Minimal native Rust CLI for signing documents with token-backed keys through Ope
 
 ## Why this shape
 
-The issue asks for an OS X/Linux/Windows native tool and explicitly raises the OpenSSL-provider question. This repository now ships a small Rust binary that keeps the UX native while delegating the actual token access to OpenSSL 3 providers (for example `pkcs11`) configured for PKCS#11 tokens such as a Рутокен ЭЦП 3.0 USB stick.
+The issue asks for an OS X/Linux/Windows native tool and explicitly raises the OpenSSL-provider question. This repository now ships a small Rust binary that keeps the UX native while delegating the actual token access to OpenSSL 3 providers (for example `pkcs11`) configured for PKCS#11-backed keys.
 
 That gives us:
 
 - a single cross-platform Rust executable;
 - no private-key export from the token;
 - compatibility with provider-based integrations instead of hard-coding one token SDK;
-- app-local provider/module wiring, so the tool does not need a system-wide reference implementation installation.
+- app-local provider/module wiring, so the tool does not depend on a system-wide token stack installation.
 
 ## Usage
 
@@ -23,7 +23,7 @@ cargo run -- sign \
   --key-uri 'pkcs11:token=Signer;id=%01' \
   --digest md_gost12_256 \
   --provider-path ./ossl-modules \
-  --pkcs11-module ./librtpkcs11ecp.so \
+  --pkcs11-module ./pkcs11-module.so \
   --dry-run
 ```
 
@@ -33,8 +33,10 @@ Remove `--dry-run` to execute `openssl cms -sign`.
 
 - The private key is expected to stay on the token and be referenced by `--key-uri`.
 - The signer certificate is provided as a PEM file via `--cert`.
-- For a Рутокен ЭЦП 3.0 key with algorithm `ГОСТ Р 34.10-2012` (256-bit), pass `--digest md_gost12_256` to request the matching GOST digest explicitly; the token-backed key and certificate still determine the signature primitive itself.
+- `--digest` selects the OpenSSL hash/digest name passed as `-md`.
+- For `ГОСТ Р 34.10-2012` with a 256-bit key, use `--digest md_gost12_256`, which is the OpenSSL name for `ГОСТ Р 34.11-2012` 256-bit.
+- For `ГОСТ Р 34.11-2012` 512-bit hashing, use `--digest md_gost12_512`.
 - `--provider-path` can point at an application-bundled OpenSSL provider directory instead of relying on a system install.
 - `--pkcs11-module` maps directly to `PKCS11_PROVIDER_MODULE`, so the token driver can live next to the app instead of being registered system-wide.
-- For Рутокен ЭЦП 3.0, the bundled PKCS#11 library is typically `librtpkcs11ecp.so` on Linux, `librtpkcs11ecp.dylib` on macOS, or `rtPKCS11ECP.dll` on Windows.
+- The concrete PKCS#11 module path is deployment-specific and supplied explicitly with `--pkcs11-module`; the CLI does not hard-code any vendor library names.
 - `--provider-config` remains available as an escape hatch for advanced provider settings that are not yet modeled directly in the CLI.
