@@ -12,6 +12,7 @@ pub struct SignCommand {
     pub output: PathBuf,
     pub cert: PathBuf,
     pub key_uri: String,
+    pub digest: Option<String>,
     pub provider: String,
     pub pkcs11_module: Option<PathBuf>,
     pub provider_path: Option<PathBuf>,
@@ -73,6 +74,7 @@ impl SignCommand {
         let mut output = None;
         let mut cert = None;
         let mut key_uri = None;
+        let mut digest = None;
         let mut provider = String::from("pkcs11");
         let mut pkcs11_module = None;
         let mut provider_path = None;
@@ -90,6 +92,9 @@ impl SignCommand {
                 "--cert" => cert = Some(PathBuf::from(next_value(&mut iter, "--cert")?)),
                 "--key-uri" => {
                     key_uri = Some(next_value(&mut iter, "--key-uri")?.to_string_lossy().into())
+                }
+                "--digest" => {
+                    digest = Some(next_value(&mut iter, "--digest")?.to_string_lossy().into())
                 }
                 "--provider" => {
                     provider = next_value(&mut iter, "--provider")?
@@ -128,6 +133,7 @@ impl SignCommand {
             output: required_path(output, "--output")?,
             cert: required_path(cert, "--cert")?,
             key_uri: required_string(key_uri, "--key-uri")?,
+            digest,
             provider,
             pkcs11_module,
             provider_path,
@@ -162,6 +168,14 @@ impl SignCommand {
         if self.key_uri.trim().is_empty() {
             return Err(CliError::Usage(
                 String::from("--key-uri must not be empty\n\n") + &usage(),
+            ));
+        }
+
+        if let Some(digest) = &self.digest
+            && digest.trim().is_empty()
+        {
+            return Err(CliError::Usage(
+                String::from("--digest must not be empty\n\n") + &usage(),
             ));
         }
 
@@ -203,6 +217,11 @@ impl SignCommand {
         if let Some(provider_config) = &self.provider_config {
             args.push(OsString::from("-config"));
             args.push(provider_config.clone().into_os_string());
+        }
+
+        if let Some(digest) = &self.digest {
+            args.push(OsString::from("-md"));
+            args.push(OsString::from(digest));
         }
 
         if self.embed_content {
@@ -371,6 +390,7 @@ fn usage() -> String {
          Works with PKCS#11-backed tokens such as Рутокен ЭЦП 3.0.\n\
          \n\
          Options:\n\
+           --digest <NAME>           Digest to pass as -md (for example md_gost12_256)\n\
            --provider <NAME>         OpenSSL provider name (default: pkcs11)\n\
            --pkcs11-module <FILE>    PKCS#11 driver to use via PKCS11_PROVIDER_MODULE\n\
            --provider-path <DIR>     OpenSSL provider search path\n\
@@ -383,6 +403,7 @@ fn usage() -> String {
          Example:\n\
            cryptokiddie sign --input contract.pdf --output contract.pdf.p7s \\\n\
              --cert signer.pem --key-uri pkcs11:token=Signer;id=%01 \\\n\
+             --digest md_gost12_256 \\\n\
              --pkcs11-module ./librtpkcs11ecp.so --dry-run\n",
     )
 }
@@ -418,6 +439,7 @@ mod tests {
         .expect("command should parse");
 
         assert_eq!(command.provider, "pkcs11");
+        assert_eq!(command.digest, None);
         assert_eq!(command.pkcs11_module, None);
         assert_eq!(command.openssl_bin, super::default_openssl_binary());
         assert!(!command.embed_content);
@@ -426,7 +448,7 @@ mod tests {
     }
 
     #[test]
-    fn renders_provider_configuration_and_passthrough_arguments() {
+    fn renders_provider_configuration_digest_and_passthrough_arguments() {
         let temp = TempDir::new();
         let input = temp.write_file("document.txt", "hello");
         let cert = temp.write_file("signer.pem", "-----BEGIN CERTIFICATE-----");
@@ -444,6 +466,8 @@ mod tests {
             cert.clone().into_os_string(),
             OsString::from("--key-uri"),
             OsString::from("pkcs11:token=Signer;id=%01"),
+            OsString::from("--digest"),
+            OsString::from("md_gost12_256"),
             OsString::from("--provider"),
             OsString::from("legacy-pkcs11"),
             OsString::from("--pkcs11-module"),
@@ -466,8 +490,9 @@ mod tests {
         assert!(rendered.contains("-provider legacy-pkcs11"));
         assert!(rendered.contains("-provider-path"));
         assert!(rendered.contains("-config"));
+        assert!(rendered.contains("-md md_gost12_256"));
         assert!(rendered.contains("-nodetach"));
-        assert!(rendered.contains("-md sha256"));
+        assert!(rendered.contains("-binary -in"));
     }
 
     #[test]
@@ -512,6 +537,8 @@ mod tests {
             cert.into_os_string(),
             OsString::from("--key-uri"),
             OsString::from("pkcs11:token=Signer;id=%01"),
+            OsString::from("--digest"),
+            OsString::from("md_gost12_256"),
             OsString::from("--pkcs11-module"),
             module.into_os_string(),
             OsString::from("--dry-run"),
@@ -519,6 +546,7 @@ mod tests {
         .expect("dry run should succeed");
 
         assert!(output.contains("PKCS11_PROVIDER_MODULE="));
+        assert!(output.contains("-md md_gost12_256"));
         assert!(output.contains("\nopenssl cms -sign -binary"));
     }
 
