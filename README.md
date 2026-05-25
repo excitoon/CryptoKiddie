@@ -36,6 +36,7 @@ Remove `--dry-run` to execute `openssl cms -sign`.
 - `--digest` selects the OpenSSL hash/digest name passed as `-md`.
 - For `ГОСТ Р 34.10-2012` with a 256-bit key, use `--digest md_gost12_256`, which is the OpenSSL name for `ГОСТ Р 34.11-2012` 256-bit.
 - For `ГОСТ Р 34.11-2012` 512-bit hashing, use `--digest md_gost12_512`.
+- The target USB token profile discussed for this workflow is `Rutoken ECP (Рутокен ЭЦП 3.0)` from Aktiv, exposed on USB as VID `0x0a89` / PID `0x0030`.
 - `--provider-path` can point at an application-bundled OpenSSL provider directory instead of relying on a system install.
 - `--pkcs11-module` maps directly to `PKCS11_PROVIDER_MODULE`, so the token driver can live next to the app instead of being registered system-wide.
 - The concrete PKCS#11 module path is deployment-specific and supplied explicitly with `--pkcs11-module`; the CLI does not hard-code any vendor library names.
