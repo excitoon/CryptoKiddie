@@ -33,7 +33,7 @@ Remove `--dry-run` to execute `openssl cms -sign`.
 
 - The private key is expected to stay on the token and be referenced by `--key-uri`.
 - The signer certificate is provided as a PEM file via `--cert`.
-- For a Рутокен ЭЦП 3.0 key with algorithm `ГОСТ Р 34.10-2012` (256-bit), pass `--digest md_gost12_256`; OpenSSL infers the matching signature algorithm from the token-backed key and certificate.
+- For a Рутокен ЭЦП 3.0 key with algorithm `ГОСТ Р 34.10-2012` (256-bit), pass `--digest md_gost12_256` to request the matching GOST digest explicitly; the token-backed key and certificate still determine the signature primitive itself.
 - `--provider-path` can point at an application-bundled OpenSSL provider directory instead of relying on a system install.
 - `--pkcs11-module` maps directly to `PKCS11_PROVIDER_MODULE`, so the token driver can live next to the app instead of being registered system-wide.
 - For Рутокен ЭЦП 3.0, the bundled PKCS#11 library is typically `librtpkcs11ecp.so` on Linux, `librtpkcs11ecp.dylib` on macOS, or `rtPKCS11ECP.dll` on Windows.
