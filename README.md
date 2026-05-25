@@ -16,7 +16,7 @@ The signing path is native Rust plus token hardware. It does not shell out to Op
 - construct the CMS/PKCS#7 `SignedData` envelope through Rust CMS code rather than shelling out to OpenSSL;
 - support two token transports:
   - `pkcs11`, using the Rust `cryptoki` crate against any supplied PKCS#11 module;
-  - `ccid`, the direct USB/CCID APDU protocol boundary for replacing vendor driver behavior.
+  - `ccid`, the direct USB/CCID APDU protocol boundary for hardware-specific integrations.
 
 ## Usage
 
@@ -45,15 +45,15 @@ cargo run -- sign \
   --pin-env TOKEN_PIN \
   --dry-run
 
-# GOST 34.10-2012 with 256-bit key (Rutoken ECP or any GOST-capable token)
+# GOST 34.10-2012 with 256-bit key (any GOST-capable PKCS#11 token)
 cargo run -- sign \
   --input contract.pdf \
   --output contract.pdf.p7s \
   --cert signer.der \
   --key-uri 'pkcs11:token=Signer;id=%01' \
   --digest gost12-256 \
-  --pkcs11-module ./rutoken-pkcs11.so \
-  --pin-env RUTOKEN_PIN \
+  --pkcs11-module ./gost-pkcs11.so \
+  --pin-env TOKEN_PIN \
   --dry-run
 ```
 

@@ -90,10 +90,6 @@ pub mod apdu {
 pub mod ccid {
     use super::{CliError, apdu::CommandApdu};
 
-    pub const RUTOKEN_ECP3_USB_VID: u16 = 0x0a89;
-    pub const RUTOKEN_ECP3_USB_PID: u16 = 0x0030;
-    pub const RUTOKEN_ECP3_PRODUCT: &str = "Rutoken ECP (Рутокен ЭЦП 3.0)";
-
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct XfrBlock {
         pub slot: u8,
@@ -1280,7 +1276,7 @@ fn usage() -> String {
          \n\
            cryptokiddie sign --input contract.pdf --output contract.pdf.p7s \\\n\
                --cert signer.der --key-uri pkcs11:token=Signer;id=%01 \\\n\
-               --digest gost12-256 --pkcs11-module ./rutoken-pkcs11.so --dry-run\n",
+               --digest gost12-256 --pkcs11-module ./gost-pkcs11.so --dry-run\n",
     )
 }
 
@@ -1516,8 +1512,8 @@ mod tests {
 
         assert!(output.contains("transport=ccid"));
         assert!(output.contains("ccid_reader=Alcor Micro AU9560"));
-        assert!(!output.contains("0x0a89"));
-        assert!(!output.contains("0x0030"));
+        assert!(!output.contains("vid="));
+        assert!(!output.contains("pid="));
     }
 
     #[test]
