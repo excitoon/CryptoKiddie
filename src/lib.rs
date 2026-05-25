@@ -402,10 +402,7 @@ pub mod token {
             let session = ctx.open_rw_session(slot).map_err(|error| {
                 CliError::Message(format!("failed to open PKCS#11 session: {error}"))
             })?;
-            let pin = self
-                .pin
-                .as_ref()
-                .map(|pin| AuthPin::new(pin.clone().into()));
+            let pin = self.pin.as_deref().map(|pin| AuthPin::new(pin.into()));
             session
                 .login(UserType::User, pin.as_ref())
                 .map_err(|error| {
@@ -553,6 +550,10 @@ pub mod token {
     }
 
     fn gost3410_mechanism() -> Mechanism<'static> {
+        assert_eq!(
+            std::mem::size_of::<cryptoki_sys::CK_MECHANISM_TYPE>(),
+            std::mem::size_of::<MechanismType>()
+        );
         let mechanism_type = unsafe {
             // CKM_GOSTR3410 is present in cryptoki-sys but not yet modelled by cryptoki's safe
             // Mechanism enum; MechanismType is the crate's transparent newtype over CK_MECHANISM_TYPE.
@@ -572,7 +573,7 @@ pub mod token {
         let mut index = 0;
         while index < bytes.len() {
             if bytes[index] == b'%' {
-                if index + 2 >= bytes.len() {
+                if index + 3 > bytes.len() {
                     return Err(CliError::Usage(format!(
                         "invalid percent escape in PKCS#11 URI: {value}"
                     )));
@@ -609,6 +610,15 @@ pub enum DigestAlgorithm {
     Gost3411_2012_512,
 }
 
+const OID_GOST3410_2012_256: const_oid::ObjectIdentifier =
+    const_oid::ObjectIdentifier::new_unwrap("1.2.643.7.1.1.1.1");
+const OID_GOST3410_2012_512: const_oid::ObjectIdentifier =
+    const_oid::ObjectIdentifier::new_unwrap("1.2.643.7.1.1.1.2");
+const OID_GOST3411_2012_256: const_oid::ObjectIdentifier =
+    const_oid::ObjectIdentifier::new_unwrap("1.2.643.7.1.1.2.2");
+const OID_GOST3411_2012_512: const_oid::ObjectIdentifier =
+    const_oid::ObjectIdentifier::new_unwrap("1.2.643.7.1.1.2.3");
+
 impl DigestAlgorithm {
     pub fn parse(name: &str) -> Result<Self, CliError> {
         match name {
@@ -644,15 +654,15 @@ impl DigestAlgorithm {
 
     pub fn digest_oid(self) -> const_oid::ObjectIdentifier {
         match self {
-            Self::Gost3411_2012_256 => const_oid::ObjectIdentifier::new_unwrap("1.2.643.7.1.1.2.2"),
-            Self::Gost3411_2012_512 => const_oid::ObjectIdentifier::new_unwrap("1.2.643.7.1.1.2.3"),
+            Self::Gost3411_2012_256 => OID_GOST3411_2012_256,
+            Self::Gost3411_2012_512 => OID_GOST3411_2012_512,
         }
     }
 
     pub fn signature_oid(self) -> const_oid::ObjectIdentifier {
         match self {
-            Self::Gost3411_2012_256 => const_oid::ObjectIdentifier::new_unwrap("1.2.643.7.1.1.1.1"),
-            Self::Gost3411_2012_512 => const_oid::ObjectIdentifier::new_unwrap("1.2.643.7.1.1.1.2"),
+            Self::Gost3411_2012_256 => OID_GOST3410_2012_256,
+            Self::Gost3411_2012_512 => OID_GOST3410_2012_512,
         }
     }
 }
