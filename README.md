@@ -26,6 +26,7 @@ cargo run -- sign \
   --key-uri 'pkcs11:token=Signer;id=%01' \
   --digest gost12-256 \
   --pkcs11-module ./opensc-pkcs11.so \
+  --pin-env RUTOKEN_PIN \
   --dry-run
 ```
 
@@ -48,5 +49,5 @@ cargo run -- sign \
 
 - The OpenSSL command execution path has been removed.
 - `ГОСТ Р 34.11-2012` hashing is implemented in Rust through `streebog` for 256-bit and 512-bit variants (`gost12-256`, `gost12-512`, plus the OpenSSL-compatible aliases `md_gost12_256` and `md_gost12_512`).
-- CMS construction, PKCS#11 signing, and direct USB/CCID signing are now explicit Rust module boundaries with unit coverage.
-- Live Rutoken signing and complete proprietary PKCS#11 driver replacement still require hardware-backed mechanism/APDU validation before the CLI can safely emit a final CMS signature.
+- CMS construction and PKCS#11 signing are wired into the non-dry-run path: the CLI hashes the input, opens a token session with `cryptoki`, signs with the token's `CKM_GOSTR3410` mechanism, builds CMS `SignedData`, and writes DER `.p7s` output.
+- Direct USB/CCID signing and complete proprietary PKCS#11 driver replacement still require hardware-backed mechanism/APDU validation before the CLI can safely use that transport for final signatures.

@@ -83,7 +83,11 @@ name = "cryptokiddie"
 version = "0.1.0"
 dependencies = [
  "cms",
+ "const-oid",
  "cryptoki",
+ "cryptoki-sys",
+ "der",
+ "spki",
  "streebog",
 ]
 
