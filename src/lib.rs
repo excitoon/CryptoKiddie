@@ -2229,7 +2229,10 @@ pub mod gosuslugi_bridge {
         response.write_to(&mut stream)
     }
 
-    fn sign_files(config: &BridgeConfig, request: SignatureRequest) -> Result<Vec<String>, CliError> {
+    fn sign_files(
+        config: &BridgeConfig,
+        request: SignatureRequest,
+    ) -> Result<Vec<String>, CliError> {
         let (files, detached) = match request {
             SignatureRequest::Envelope(envelope) => {
                 if envelope.files.is_empty() {
@@ -2237,7 +2240,10 @@ pub mod gosuslugi_bridge {
                         "signature request did not include files".to_string(),
                     ));
                 }
-                (envelope.files, envelope.r#type.eq_ignore_ascii_case("detached"))
+                (
+                    envelope.files,
+                    envelope.r#type.eq_ignore_ascii_case("detached"),
+                )
             }
             SignatureRequest::File(file) => (vec![file], false),
         };
