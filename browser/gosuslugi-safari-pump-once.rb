@@ -47,12 +47,23 @@ requests.each do |request|
   begin
     response = Net::HTTP.post(uri, JSON.generate(payload), "content-type" => "application/json")
     ok = response.is_a?(Net::HTTPSuccess)
-    body = ok ? JSON.parse(response.body) : { "error" => "CryptoKiddie bridge HTTP #{response.code}" }
+    body_json = ok ? response.body : JSON.generate({ "error" => "CryptoKiddie bridge HTTP #{response.code}" })
+    JSON.parse(body_json)
   rescue StandardError => error
     ok = false
-    body = { "error" => error.message }
+    body_json = JSON.generate({ "error" => error.message })
   end
 
-  safari_javascript("window.__cryptokiddieBridgeDeliver(#{id.to_json}, #{ok ? "true" : "false"}, #{JSON.generate(body)});")
+  safari_javascript("window.__cryptokiddieBridgeChunks = window.__cryptokiddieBridgeChunks || {}; window.__cryptokiddieBridgeChunks[#{id.to_json}] = [];")
+  body_json.scan(/.{1,12000}/m).each do |chunk|
+    safari_javascript("window.__cryptokiddieBridgeChunks[#{id.to_json}].push(#{chunk.to_json});")
+  end
+  safari_javascript(<<~JAVASCRIPT)
+    (() => {
+      const chunks = window.__cryptokiddieBridgeChunks && window.__cryptokiddieBridgeChunks[#{id.to_json}];
+      delete window.__cryptokiddieBridgeChunks[#{id.to_json}];
+      window.__cryptokiddieBridgeDeliver(#{id.to_json}, #{ok ? "true" : "false"}, JSON.parse(chunks.join("")));
+    })();
+  JAVASCRIPT
   puts "delivered id=#{id} path=#{path} ok=#{ok}"
 end

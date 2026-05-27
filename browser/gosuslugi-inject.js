@@ -83,7 +83,39 @@
       module: original.module,
       meta: original.meta
     });
+    window.__cryptokiddiePostedReplies = window.__cryptokiddiePostedReplies || [];
+    window.__cryptokiddiePostedReplies.push({
+      id: message.id,
+      method: message.method && message.method.type,
+      resultLength: message.method && message.method.result ? message.method.result.length : 0,
+      error: message.error || ""
+    });
     source.postMessage(message, "*");
+  }
+
+  const partialCryptoPayloads = {};
+
+  function parsePluginPayload(method, data, original, source) {
+    if (!data) return { ready: true, payload: {}, original, source };
+    const key = method;
+    const text = String(data);
+    if (!partialCryptoPayloads[key]) {
+      try {
+        return { ready: true, payload: JSON.parse(text), original, source };
+      } catch (_error) {
+        partialCryptoPayloads[key] = { text, original, source };
+        return { ready: false };
+      }
+    }
+    partialCryptoPayloads[key].text += text;
+    try {
+      const pending = partialCryptoPayloads[key];
+      const payload = JSON.parse(pending.text);
+      delete partialCryptoPayloads[key];
+      return { ready: true, payload, original: pending.original, source: pending.source };
+    } catch (_error) {
+      return { ready: false };
+    }
   }
 
   async function handleCryptoMessage(event) {
@@ -94,13 +126,17 @@
     const method = message.method.type;
     try {
       if (method === "certificates") {
-        const payload = message.method.data ? JSON.parse(message.method.data) : {};
+        const parsed = parsePluginPayload(method, message.method.data, message, event.source || window);
+        if (!parsed.ready) return;
+        const payload = parsed.payload;
         const result = await postJson("/certificates", payload);
-        replyToPostedMessage(event.source || window, message, pluginMessage(method, result.certificates));
+        replyToPostedMessage(parsed.source, parsed.original, pluginMessage(method, result.certificates));
       } else if (method === "signature" || method === "signatureV2") {
-        const payload = message.method.data ? JSON.parse(message.method.data) : {};
+        const parsed = parsePluginPayload(method, message.method.data, message, event.source || window);
+        if (!parsed.ready) return;
+        const payload = parsed.payload;
         const result = await postJson("/signature", payload);
-        replyToPostedMessage(event.source || window, message, pluginMessage(method, result.contents.map((content) => ({ content }))));
+        replyToPostedMessage(parsed.source, parsed.original, pluginMessage(method, result.contents.map((content) => ({ content }))));
       } else if (method === "providers" || method === "tokens") {
         replyToPostedMessage(event.source || window, message, pluginMessage(method, []));
       }
@@ -144,8 +180,21 @@
     };
   }
 
+  function keepDirectFallbackActive() {
+    const started = Date.now();
+    const timer = window.setInterval(() => {
+      try {
+        gosuslugiPluginCrypto = window.gosuslugiPluginCrypto;
+      } catch (_error) {}
+      if (Date.now() - started > 30000) {
+        window.clearInterval(timer);
+      }
+    }, 250);
+  }
+
   ensureMarker();
   installDirectFallback();
+  keepDirectFallbackActive();
   window.addEventListener("message", handleCryptoMessage);
   console.info("CryptoKiddie Gosuslugi bridge injected", bridgeUrl);
 })();

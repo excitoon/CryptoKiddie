@@ -2045,7 +2045,7 @@ pub mod gosuslugi_bridge {
     };
     use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
     use cms::cert::x509::{Certificate, ext::pkix::name::DirectoryString, name::Name};
-    use der::{Decode, Encode, asn1::Ia5StringRef};
+    use der::{Decode, Encode, Tag, Tagged, asn1::Ia5StringRef};
     use serde::{Deserialize, Serialize};
     use std::{
         io::{Read, Write},
@@ -2079,7 +2079,14 @@ pub mod gosuslugi_bridge {
     }
 
     #[derive(Debug, Deserialize)]
-    struct SignatureRequest {
+    #[serde(untagged)]
+    enum SignatureRequest {
+        Envelope(SignatureEnvelope),
+        File(BridgeFile),
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct SignatureEnvelope {
         files: Vec<BridgeFile>,
         #[allow(dead_code)]
         certificate: Option<BridgeFile>,
@@ -2209,11 +2216,11 @@ pub mod gosuslugi_bridge {
                     serde_json::from_slice(&request.body).map_err(|error| {
                         CliError::Message(format!("invalid signature JSON: {error}"))
                     })?;
-                let signature = sign_first_file(config, request)?;
+                let signatures = sign_files(config, request)?;
                 HttpResponse::json(
                     200,
                     &SignatureResponse {
-                        contents: vec![signature],
+                        contents: signatures,
                     },
                 )?
             }
@@ -2222,13 +2229,34 @@ pub mod gosuslugi_bridge {
         response.write_to(&mut stream)
     }
 
-    fn sign_first_file(
+    fn sign_files(config: &BridgeConfig, request: SignatureRequest) -> Result<Vec<String>, CliError> {
+        let (files, detached) = match request {
+            SignatureRequest::Envelope(envelope) => {
+                if envelope.files.is_empty() {
+                    return Err(CliError::Message(
+                        "signature request did not include files".to_string(),
+                    ));
+                }
+                (envelope.files, envelope.r#type.eq_ignore_ascii_case("detached"))
+            }
+            SignatureRequest::File(file) => (vec![file], false),
+        };
+        files
+            .into_iter()
+            .map(|file| sign_file(config, file, detached))
+            .collect()
+    }
+
+    fn sign_file(
         config: &BridgeConfig,
-        request: SignatureRequest,
+        file: BridgeFile,
+        detached: bool,
     ) -> Result<String, CliError> {
-        let file = request.files.first().ok_or_else(|| {
-            CliError::Message("signature request did not include files".to_string())
-        })?;
+        if file.content.trim().is_empty() {
+            return Err(CliError::Message(
+                "signature request file did not include content".to_string(),
+            ));
+        }
         if !file.content_encoding.is_empty() && file.content_encoding != "base64" {
             return Err(CliError::Message(format!(
                 "unsupported file contentEncoding: {}",
@@ -2244,7 +2272,6 @@ pub mod gosuslugi_bridge {
                 "signature request requires signer certificate DER; provide --cert or a certificate record with base64 DER in raw".to_string(),
             ));
         };
-        let detached = request.r#type.eq_ignore_ascii_case("detached");
         let cms_input = cms_envelope::CmsSigningInput::new(
             digest,
             config.digest_algorithm,
@@ -2280,6 +2307,18 @@ pub mod gosuslugi_bridge {
     fn any_to_string(any: &der::asn1::Any) -> String {
         if let Ok(value) = DirectoryString::try_from(any) {
             return value.value().into_owned();
+        }
+        if matches!(
+            any.tag(),
+            Tag::NumericString
+                | Tag::PrintableString
+                | Tag::TeletexString
+                | Tag::VideotexString
+                | Tag::VisibleString
+                | Tag::GeneralString
+        ) && let Ok(value) = std::str::from_utf8(any.value())
+        {
+            return value.to_string();
         }
         if let Ok(value) = Ia5StringRef::try_from(any) {
             return value.as_str().to_string();
@@ -2413,7 +2452,7 @@ pub mod gosuslugi_bridge {
                 _ => "OK",
             };
             let header = format!(
-                "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: https://lk.gosuslugi.ru\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: content-type\r\nAccess-Control-Allow-Private-Network: true\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: content-type\r\nAccess-Control-Allow-Private-Network: true\r\nConnection: close\r\n\r\n",
                 self.status,
                 reason,
                 self.content_type,
