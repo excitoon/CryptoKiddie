@@ -624,6 +624,7 @@ pub mod ccid {
     }
 }
 
+#[cfg(feature = "pcsc")]
 pub mod pcsc_transport {
     use super::{
         CliError,
@@ -1396,6 +1397,7 @@ pub mod token {
 
     enum ApduDevice {
         Ccid(super::ccid::CcidDevice),
+        #[cfg(feature = "pcsc")]
         Pcsc(super::pcsc_transport::PcscDevice),
     }
 
@@ -1407,31 +1409,36 @@ pub mod token {
             ) {
                 Ok(mut device) => match device.power_on() {
                     Ok(_) => Ok(Self::Ccid(device)),
-                    Err(usb_error) => Self::open_pcsc(config, Some(usb_error)),
+                    Err(usb_error) => Self::open_after_ccid_error(config, usb_error),
                 },
-                Err(usb_error) => Self::open_pcsc(config, Some(usb_error)),
+                Err(usb_error) => Self::open_after_ccid_error(config, usb_error),
             }
         }
 
-        fn open_pcsc(
+        #[cfg(feature = "pcsc")]
+        fn open_after_ccid_error(
             config: &CcidSignerConfig,
-            usb_error: Option<CliError>,
+            usb_error: CliError,
         ) -> Result<Self, CliError> {
             match super::pcsc_transport::PcscDevice::open_with_exchange_log(
                 config.reader.as_deref(),
                 config.exchange_log.as_deref(),
             ) {
                 Ok(device) => Ok(Self::Pcsc(device)),
-                Err(pcsc_error) => {
-                    if let Some(usb_error) = usb_error {
-                        Err(CliError::Message(format!(
-                            "failed to open Rutoken via raw CCID ({usb_error}) or PC/SC ({pcsc_error})"
-                        )))
-                    } else {
-                        Err(pcsc_error)
-                    }
-                }
+                Err(pcsc_error) => Err(CliError::Message(format!(
+                    "failed to open Rutoken via raw CCID ({usb_error}) or PC/SC ({pcsc_error})"
+                ))),
             }
+        }
+
+        #[cfg(not(feature = "pcsc"))]
+        fn open_after_ccid_error(
+            _config: &CcidSignerConfig,
+            usb_error: CliError,
+        ) -> Result<Self, CliError> {
+            Err(CliError::Message(format!(
+                "failed to open Rutoken via raw CCID: {usb_error}"
+            )))
         }
 
         fn transmit(
@@ -1440,6 +1447,7 @@ pub mod token {
         ) -> Result<super::apdu::ResponseApdu, CliError> {
             match self {
                 Self::Ccid(device) => device.transmit(apdu),
+                #[cfg(feature = "pcsc")]
                 Self::Pcsc(device) => device.transmit(apdu),
             }
         }
