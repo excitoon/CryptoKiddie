@@ -641,256 +641,6 @@ pub mod gost {
     }
 }
 
-pub mod pcsc_transport {
-    use super::{
-        CliError, DigestAlgorithm,
-        apdu::{CommandApdu, ResponseApdu},
-        ccid,
-    };
-    use pcsc::{Context, Protocols, Scope, ShareMode};
-    use std::path::Path;
-
-    pub struct PcscDevice {
-        card: pcsc::Card,
-        logger: Option<ccid::ExchangeLogger>,
-        sequence: u8,
-    }
-
-    impl PcscDevice {
-        pub fn open(
-            reader_filter: Option<&str>,
-            exchange_log: Option<&Path>,
-        ) -> Result<Self, CliError> {
-            let context = Context::establish(Scope::User).map_err(|error| {
-                CliError::Message(format!("failed to initialize PC/SC: {error}"))
-            })?;
-            let mut readers_buf = [0; 2048];
-            let readers = context.list_readers(&mut readers_buf).map_err(|error| {
-                CliError::Message(format!("failed to list PC/SC readers: {error}"))
-            })?;
-
-            let mut skipped_readers = Vec::new();
-            for reader in readers {
-                let reader_name = reader.to_string_lossy().into_owned();
-                if let Some(filter) = reader_filter
-                    && !reader_name.contains(filter)
-                {
-                    skipped_readers.push(reader_name);
-                    continue;
-                }
-
-                let card = context
-                    .connect(reader, ShareMode::Shared, Protocols::ANY)
-                    .map_err(|error| {
-                        CliError::Message(format!(
-                            "failed to connect to PC/SC reader {reader_name}: {error}"
-                        ))
-                    })?;
-                let mut logger = exchange_log.map(ccid::ExchangeLogger::create).transpose()?;
-                if let Some(logger) = logger.as_mut() {
-                    logger.note(&format!("opened pcsc_reader={reader_name}"))?;
-                }
-                return Ok(Self {
-                    card,
-                    logger,
-                    sequence: 0,
-                });
-            }
-
-            if let Some(filter) = reader_filter {
-                Err(CliError::Message(format!(
-                    "PC/SC reader containing {filter:?} not found; saw readers: {}",
-                    skipped_readers.join(", ")
-                )))
-            } else {
-                Err(CliError::Message(
-                    "no PC/SC smart-card readers found".to_string(),
-                ))
-            }
-        }
-
-        pub fn transmit(&mut self, apdu: &CommandApdu) -> Result<ResponseApdu, CliError> {
-            let sequence = self.next_sequence();
-            let command = apdu.to_bytes()?;
-            let (log_command, redacted) = ccid::redacted_apdu_bytes_for_log(apdu)?;
-            self.log_bytes(
-                "out",
-                "pcsc-apdu",
-                ccid::apdu_label(apdu),
-                sequence,
-                &log_command,
-                redacted,
-            )?;
-
-            let mut response_buf = [0u8; pcsc::MAX_BUFFER_SIZE];
-            let response = self
-                .card
-                .transmit(&command, &mut response_buf)
-                .map_err(|error| CliError::Message(format!("PC/SC transmit failed: {error}")))?;
-            let response = response.to_vec();
-            self.log_bytes("in", "pcsc-apdu", "RESPONSE", sequence, &response, false)?;
-            if let Some(logger) = self.logger.as_mut() {
-                logger.flush()?;
-            }
-            ResponseApdu::parse(&response)
-        }
-
-        fn next_sequence(&mut self) -> u8 {
-            let sequence = self.sequence;
-            self.sequence = self.sequence.wrapping_add(1);
-            sequence
-        }
-
-        fn log_bytes(
-            &mut self,
-            direction: &str,
-            layer: &str,
-            label: &str,
-            sequence: u8,
-            bytes: &[u8],
-            redacted: bool,
-        ) -> Result<(), CliError> {
-            if let Some(logger) = self.logger.as_mut() {
-                logger.bytes(direction, layer, label, sequence, bytes, redacted)?;
-            }
-            Ok(())
-        }
-    }
-
-    pub fn probe(
-        reader_filter: Option<&str>,
-        exchange_log: Option<&Path>,
-    ) -> Result<String, CliError> {
-        let mut device = PcscDevice::open(reader_filter, exchange_log)?;
-        let select = device.transmit(&super::rutoken::select_master_file())?;
-        Ok(format!(
-            "pcsc probe\nselect_mf_sw={:02x}{:02x}",
-            select.sw1, select.sw2
-        ))
-    }
-
-    pub fn sign_digest(
-        reader_filter: Option<&str>,
-        exchange_log: Option<&Path>,
-        key_id: u8,
-        pin: Option<&[u8]>,
-        digest_algorithm: DigestAlgorithm,
-        digest: &[u8],
-    ) -> Result<Vec<u8>, CliError> {
-        let mut device = PcscDevice::open(reader_filter, exchange_log)?;
-
-        let resp = device.transmit(&super::rutoken::select_master_file())?;
-        if !resp.is_success() {
-            return Err(CliError::Message(format!(
-                "SELECT MF failed over PC/SC: SW {:02x}{:02x}",
-                resp.sw1, resp.sw2
-            )));
-        }
-
-        if let Some(pin_bytes) = pin {
-            let mut resp = device.transmit(&super::rutoken::verify_pin(pin_bytes))?;
-            if resp.sw1 == 0x6F && resp.sw2 == 0x86 {
-                let logout = device.transmit(&super::rutoken::logout())?;
-                if !logout.is_success() {
-                    return Err(CliError::Message(format!(
-                        "LOGOUT failed over PC/SC after VERIFY returned 6f86: SW {:02x}{:02x}",
-                        logout.sw1, logout.sw2
-                    )));
-                }
-                resp = device.transmit(&super::rutoken::verify_pin(pin_bytes))?;
-            }
-            if !resp.is_success() {
-                let resp = if resp.sw1 == 0x63 && resp.sw2 == 0x00 {
-                    device.transmit(&super::rutoken::verify_pin_status())?
-                } else {
-                    resp
-                };
-                return Err(CliError::Message(format!(
-                    "VERIFY PIN failed over PC/SC: SW {:02x}{:02x}",
-                    resp.sw1, resp.sw2
-                )));
-            }
-        }
-
-        select_private_key_file(&mut device, key_id)?;
-
-        let resp = device.transmit(&super::rutoken::manage_security_environment_for_signing(
-            key_id,
-        ))?;
-        if !resp.is_success() {
-            return Err(CliError::Message(format!(
-                "MSE SET (key reference 0x{key_id:02x}) failed over PC/SC: SW {:02x}{:02x}",
-                resp.sw1, resp.sw2
-            )));
-        }
-
-        let signature_len = match digest_algorithm {
-            DigestAlgorithm::Gost3411_2012_256 => 64u8,
-            DigestAlgorithm::Gost3411_2012_512 => 128u8,
-            _ => {
-                return Err(CliError::Message(format!(
-                    "PC/SC Rutoken transport only supports GOST digests, got {}",
-                    digest_algorithm.name()
-                )));
-            }
-        };
-        let resp = device.transmit(&super::rutoken::pso_compute_digital_signature(
-            digest,
-            signature_len,
-        ))?;
-        if !resp.is_success() {
-            return Err(CliError::Message(format!(
-                "PSO COMPUTE DIGITAL SIGNATURE failed over PC/SC: SW {:02x}{:02x}",
-                resp.sw1, resp.sw2
-            )));
-        }
-
-        if resp.data.len() != signature_len as usize {
-            return Err(CliError::Message(format!(
-                "PC/SC signature length mismatch: expected {} bytes, token returned {}",
-                signature_len,
-                resp.data.len()
-            )));
-        }
-
-        Ok(super::rutoken::signature_from_token(resp.data))
-    }
-
-    fn select_private_key_file(device: &mut PcscDevice, key_id: u8) -> Result<(), CliError> {
-        let mut failures = Vec::new();
-        for sequence in super::rutoken::private_key_file_select_sequences(key_id) {
-            let reset = device.transmit(&super::rutoken::select_master_file())?;
-            if !reset.is_success() {
-                return Err(CliError::Message(format!(
-                    "SELECT MF before private key selection failed over PC/SC: SW {:02x}{:02x}",
-                    reset.sw1, reset.sw2
-                )));
-            }
-
-            let mut selected = true;
-            for apdu in sequence.commands {
-                let resp = device.transmit(&apdu)?;
-                if !resp.is_success() {
-                    failures.push(format!(
-                        "{} -> {:02x}{:02x}",
-                        sequence.label, resp.sw1, resp.sw2
-                    ));
-                    selected = false;
-                    break;
-                }
-            }
-            if selected {
-                return Ok(());
-            }
-        }
-
-        Err(CliError::Message(format!(
-            "SELECT private key file (key reference 0x{key_id:02x}) failed over PC/SC: {}",
-            failures.join(", ")
-        )))
-    }
-}
-
 /// Direct Rutoken ECP APDU sequences for hardware-backed GOST signing over CCID.
 ///
 /// These helpers construct ISO 7816-4/8 APDUs for the operations needed to
@@ -1409,18 +1159,7 @@ pub mod token {
 
             let pin: Option<Vec<u8>> = self.pin_env.as_deref().map(load_pin_bytes).transpose()?;
 
-            match sign_digest_direct(self, uri.id, pin.as_deref(), digest_algorithm, digest) {
-                Ok(signature) => Ok(signature),
-                Err(error) if should_try_pcsc(&error) => super::pcsc_transport::sign_digest(
-                    self.reader.as_deref(),
-                    self.exchange_log.as_deref(),
-                    uri.id,
-                    pin.as_deref(),
-                    digest_algorithm,
-                    digest,
-                ),
-                Err(error) => Err(error),
-            }
+            sign_digest_direct(self, uri.id, pin.as_deref(), digest_algorithm, digest)
         }
     }
 
@@ -1549,16 +1288,6 @@ pub mod token {
             "SELECT private key file (key reference 0x{key_id:02x}) failed: {}",
             failures.join(", ")
         )))
-    }
-
-    fn should_try_pcsc(error: &CliError) -> bool {
-        match error {
-            CliError::Message(message) => {
-                message.contains("failed to claim CCID interface")
-                    || message.contains("Access denied")
-            }
-            CliError::Usage(_) => false,
-        }
     }
 
     pub fn ensure_module_path(path: &Path) -> Result<(), CliError> {
@@ -2395,21 +2124,7 @@ impl CcidProbeCommand {
     }
 
     pub fn run(&self) -> Result<String, CliError> {
-        match self.run_direct() {
-            Ok(output) => Ok(output),
-            Err(error) if should_try_pcsc_probe(&error) => {
-                let output = pcsc_transport::probe(
-                    self.ccid_reader.as_deref(),
-                    self.exchange_log.as_deref(),
-                )?;
-                let mut lines = output.lines().map(str::to_string).collect::<Vec<_>>();
-                if let Some(path) = &self.exchange_log {
-                    lines.push(format!("exchange_log={}", path.display()));
-                }
-                Ok(lines.join("\n"))
-            }
-            Err(error) => Err(error),
-        }
+        self.run_direct()
     }
 
     fn run_direct(&self) -> Result<String, CliError> {
@@ -2429,15 +2144,6 @@ impl CcidProbeCommand {
             lines.push(format!("exchange_log={}", path.display()));
         }
         Ok(lines.join("\n"))
-    }
-}
-
-fn should_try_pcsc_probe(error: &CliError) -> bool {
-    match error {
-        CliError::Message(message) => {
-            message.contains("failed to claim CCID interface") || message.contains("Access denied")
-        }
-        CliError::Usage(_) => false,
     }
 }
 

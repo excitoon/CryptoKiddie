@@ -122,6 +122,5 @@ When `--key-algorithm` is omitted, GOST digests default to `gost3410-2012-256`/`
   - `ccid::IccPowerOn` / `ccid::RdrDataBlock` encode/decode the CCID `PC_to_RDR_IccPowerOn` and `RDR_to_PC_DataBlock` messages.
   - `rutoken::RutokenUri` parses `rutoken:slot=N;id=%XX` key URIs used with `--transport ccid`.
   - The ISO 7816-8 APDU sequence (SELECT MF → VERIFY user PIN ref 2 → SELECT private-key file → MSE SET → PSO COMPUTE DIGITAL SIGNATURE) is implemented in the `rutoken` module against OpenSC's `card-rtecp.c`, `pkcs15-rtecp.c`, and `rutoken_ecp.profile` as references.
-  - macOS live APDU work falls back to PC/SC when SmartCardServices owns the raw USB CCID interface.
   - Hardware raw signing was verified on the connected Osnovanie/Rutoken ECP token with `rutoken:slot=0;id=%03`, producing a 64-byte signature at `target/rutoken-readme.sig`.
   - Hardware-in-the-loop testing requires a physical Rutoken ECP 3.0 device and appropriate USB access permissions.
