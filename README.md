@@ -64,13 +64,38 @@ cargo run -- sign \
   --input contract.pdf \
   --output contract.pdf.p7s \
   --cert signer.der \
-  --key-uri 'pkcs11:slot=0;id=%01' \
+  --key-uri 'rutoken:slot=0;id=%03' \
   --transport ccid \
   --ccid-reader "Alcor Micro AU9560" \
   --dry-run
 ```
 
-`--dry-run` hashes the input and prints the native signing plan without producing a signature.
+`--dry-run` hashes the input and prints the native signing plan without producing a signature. For `rutoken:` URIs, `id=%XX` is the Rutoken private-key reference; the tested Osnovanie/Rutoken ECP token uses `id=%03`.
+
+For a direct raw signature smoke test against the tested Rutoken ECP token:
+
+```bash
+cargo run -- ccid-sign-raw \
+  --input README.md \
+  --output target/rutoken-readme.sig \
+  --key-uri 'rutoken:slot=0;id=%03' \
+  --ccid-reader 'Rutoken ECP' \
+  --exchange-log logs/ccid-sign-raw.log \
+  --pin-env TOKEN_PIN
+```
+
+`TOKEN_PIN` can be read from the environment or from the local `.env` file. `.env` is ignored by git and should not be committed.
+
+### Rutoken ECP Notes
+
+- Private key material does not leave the Rutoken. The host selects a key reference and asks the token to sign; the token returns only the signature bytes.
+- The algorithm and key capabilities are not secret in the same way as the private key. They are stored or enforced by the token and may also be visible through PKCS#15 metadata, PKCS#11 attributes, public keys, or certificates.
+- The current direct CCID path does not yet parse PKCS#15 metadata or read certificates/public keys. It uses the OpenSC-derived GOST signing flow explicitly and addresses the discovered private key as `rutoken:slot=0;id=%03`.
+- The tested signing flow computes `ГОСТ Р 34.11-2012-256` on the host, sends the digest to the token in Rutoken ECP byte order, and receives a 64-byte `ГОСТ Р 34.10-2012` signature.
+- Rutoken ECP PIN references follow Aktiv/OpenSC conventions: administrator/SO PIN ref `1`, normal user PIN ref `2`. Signing uses the user PIN ref `2`.
+- The tested token accepted the `.env` PIN only on user PIN ref `2`; using ref `1` queried the wrong PIN object. The tested signing key reference is `0x03`; `0x01` and `0x02` did not contain the private key file.
+- OpenSC behavior mirrored by the direct driver: `6300` after VERIFY is followed by a no-data VERIFY status query, and `6f86` after VERIFY is handled by `LOGOUT` (`80 40 00 00`) plus one VERIFY retry.
+- The OpenSC private-key path used successfully for `id=%03` is `3F00/1000/1000/6002/0003`.
 
 ### Supported algorithms
 
@@ -92,4 +117,10 @@ When `--key-algorithm` is omitted, GOST digests default to `gost3410-2012-256`/`
 - The OpenSSL command execution path has been removed.
 - All hashing is implemented in Rust: `ГОСТ Р 34.11-2012` through `streebog`, SHA-256/384/512 through `sha2`.
 - CMS construction and PKCS#11 signing are wired into the non-dry-run path: the CLI hashes the input, opens a token session with `cryptoki`, signs with the token's chosen mechanism (`CKM_GOSTR3410`, `CKM_ECDSA`, or `CKM_RSA_PKCS`), builds CMS `SignedData`, and writes DER `.p7s` output.
-- Direct USB/CCID signing still requires hardware-backed mechanism/APDU validation before the CLI can safely use that transport for final signatures.
+- Direct USB/CCID signing is implemented for Rutoken ECP 3.0:
+  - `ccid::CcidDevice` discovers the Rutoken ECP by VID/PID (`0x0a89`/`0x0030`), claims the CCID interface (bInterfaceClass `0x0B`), and communicates via USB bulk transfer.
+  - `ccid::IccPowerOn` / `ccid::RdrDataBlock` encode/decode the CCID `PC_to_RDR_IccPowerOn` and `RDR_to_PC_DataBlock` messages.
+  - `rutoken::RutokenUri` parses `rutoken:slot=N;id=%XX` key URIs used with `--transport ccid`.
+  - The ISO 7816-8 APDU sequence (SELECT MF → VERIFY user PIN ref 2 → SELECT private-key file → MSE SET → PSO COMPUTE DIGITAL SIGNATURE) is implemented in the `rutoken` module against OpenSC's `card-rtecp.c`, `pkcs15-rtecp.c`, and `rutoken_ecp.profile` as references.
+  - Hardware raw signing was verified on the connected Osnovanie/Rutoken ECP token with `rutoken:slot=0;id=%03`, producing a 64-byte signature at `target/rutoken-readme.sig`.
+  - Hardware-in-the-loop testing requires a physical Rutoken ECP 3.0 device and appropriate USB access permissions.

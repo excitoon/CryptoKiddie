@@ -88,7 +88,130 @@ pub mod apdu {
 }
 
 pub mod ccid {
-    use super::{CliError, apdu::CommandApdu};
+    use super::{
+        CliError,
+        apdu::{CommandApdu, ResponseApdu},
+    };
+    use rusb::{Direction, GlobalContext, TransferType};
+    use std::{
+        fs::{self, File, OpenOptions},
+        io::Write as _,
+        path::{Path, PathBuf},
+        time::{Duration, SystemTime, UNIX_EPOCH},
+    };
+
+    pub const RUTOKEN_ECP3_USB_VID: u16 = 0x0a89;
+    pub const RUTOKEN_ECP3_USB_PID: u16 = 0x0030;
+    pub const RUTOKEN_ECP3_PRODUCT: &str = "Rutoken ECP (Рутокен ЭЦП 3.0)";
+
+    /// CCID USB interface class code (USB Device Class Definition for Smart Card Devices).
+    const CCID_CLASS: u8 = 0x0B;
+
+    /// Timeout for all USB bulk transfers.
+    const TRANSFER_TIMEOUT: Duration = Duration::from_secs(10);
+
+    // CCID message type identifiers (USB CCID spec §6).
+    pub const PC_TO_RDR_ICCPOWERON: u8 = 0x62;
+    pub const PC_TO_RDR_XFRBLOCK: u8 = 0x6f;
+    pub const RDR_TO_PC_DATABLOCK: u8 = 0x80;
+
+    #[derive(Debug)]
+    pub struct ExchangeLogger {
+        path: PathBuf,
+        file: File,
+    }
+
+    impl ExchangeLogger {
+        pub fn create(path: &Path) -> Result<Self, CliError> {
+            if let Some(parent) = path.parent()
+                && !parent.as_os_str().is_empty()
+            {
+                fs::create_dir_all(parent).map_err(|error| {
+                    CliError::Message(format!(
+                        "failed to create exchange log directory {}: {error}",
+                        parent.display()
+                    ))
+                })?;
+            }
+            let mut file = OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(path)
+                .map_err(|error| {
+                    CliError::Message(format!(
+                        "failed to create exchange log {}: {error}",
+                        path.display()
+                    ))
+                })?;
+            writeln!(file, "# cryptokiddie CCID exchange log").map_err(log_write_error)?;
+            Ok(Self {
+                path: path.to_path_buf(),
+                file,
+            })
+        }
+
+        pub fn path(&self) -> &Path {
+            &self.path
+        }
+
+        pub(crate) fn note(&mut self, message: &str) -> Result<(), CliError> {
+            writeln!(self.file, "{} note {}", timestamp_ms(), message).map_err(log_write_error)
+        }
+
+        pub(crate) fn bytes(
+            &mut self,
+            direction: &str,
+            layer: &str,
+            label: &str,
+            sequence: u8,
+            bytes: &[u8],
+            redacted: bool,
+        ) -> Result<(), CliError> {
+            writeln!(
+                self.file,
+                "{} direction={} layer={} label={} seq={} len={} redacted={} bytes={}",
+                timestamp_ms(),
+                direction,
+                layer,
+                label,
+                sequence,
+                bytes.len(),
+                redacted,
+                super::hex_encode(bytes)
+            )
+            .map_err(log_write_error)
+        }
+
+        fn response_summary(&mut self, response: &RdrDataBlock) -> Result<(), CliError> {
+            writeln!(
+                self.file,
+                "{} direction=in layer=ccid-summary seq={} status=0x{:02x} error=0x{:02x} chain=0x{:02x} data_len={}",
+                timestamp_ms(),
+                response.sequence,
+                response.status,
+                response.error,
+                response.chain_param,
+                response.data.len()
+            )
+            .map_err(log_write_error)
+        }
+
+        pub(crate) fn flush(&mut self) -> Result<(), CliError> {
+            self.file.flush().map_err(log_write_error)
+        }
+    }
+
+    fn timestamp_ms() -> u128 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis())
+            .unwrap_or_default()
+    }
+
+    fn log_write_error(error: std::io::Error) -> CliError {
+        CliError::Message(format!("failed to write CCID exchange log: {error}"))
+    }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct XfrBlock {
@@ -117,7 +240,7 @@ pub mod ccid {
             })?;
 
             let mut bytes = Vec::with_capacity(10 + apdu.len());
-            bytes.push(0x6f);
+            bytes.push(PC_TO_RDR_XFRBLOCK);
             bytes.extend_from_slice(&apdu_len.to_le_bytes());
             bytes.push(self.slot);
             bytes.push(self.sequence);
@@ -125,6 +248,378 @@ pub mod ccid {
             bytes.extend_from_slice(&self.level_parameter.to_le_bytes());
             bytes.extend_from_slice(&apdu);
             Ok(bytes)
+        }
+    }
+
+    /// PC_to_RDR_IccPowerOn message (CCID spec §6.1.1).
+    ///
+    /// Powers on the ICC inserted in the given slot. The reader responds with
+    /// `RDR_to_PC_DataBlock` whose data field carries the ATR.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct IccPowerOn {
+        pub slot: u8,
+        pub sequence: u8,
+        /// 0x00 = automatic voltage selection.
+        pub power_select: u8,
+    }
+
+    impl IccPowerOn {
+        pub fn new(slot: u8, sequence: u8) -> Self {
+            Self {
+                slot,
+                sequence,
+                power_select: 0x00,
+            }
+        }
+
+        pub fn to_bytes(&self) -> Vec<u8> {
+            vec![
+                PC_TO_RDR_ICCPOWERON,
+                0x00,
+                0x00,
+                0x00,
+                0x00, // dwLength = 0
+                self.slot,
+                self.sequence,
+                self.power_select,
+                0x00,
+                0x00, // abRFU
+            ]
+        }
+    }
+
+    /// Parsed `RDR_to_PC_DataBlock` response from the reader (CCID spec §6.2.1).
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct RdrDataBlock {
+        pub slot: u8,
+        pub sequence: u8,
+        /// `bStatus`: upper two bits are bmCommandStatus, lower two bits are bmICCStatus.
+        pub status: u8,
+        pub error: u8,
+        pub chain_param: u8,
+        pub data: Vec<u8>,
+    }
+
+    impl RdrDataBlock {
+        /// Parse a raw byte slice from a USB bulk-in transfer.
+        pub fn parse(bytes: &[u8]) -> Result<Self, CliError> {
+            if bytes.len() < 10 {
+                return Err(CliError::Message(format!(
+                    "CCID response too short: {} bytes (minimum 10)",
+                    bytes.len()
+                )));
+            }
+            if bytes[0] != RDR_TO_PC_DATABLOCK {
+                return Err(CliError::Message(format!(
+                    "expected RDR_to_PC_DataBlock (0x{RDR_TO_PC_DATABLOCK:02x}), got 0x{:02x}",
+                    bytes[0]
+                )));
+            }
+            let data_len = u32::from_le_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]) as usize;
+            if bytes.len() < 10 + data_len {
+                return Err(CliError::Message(format!(
+                    "CCID response data truncated: header claims {} bytes, got {}",
+                    data_len,
+                    bytes.len().saturating_sub(10)
+                )));
+            }
+            Ok(Self {
+                slot: bytes[5],
+                sequence: bytes[6],
+                status: bytes[7],
+                error: bytes[8],
+                chain_param: bytes[9],
+                data: bytes[10..10 + data_len].to_vec(),
+            })
+        }
+
+        /// Returns `true` when bmCommandStatus (bits 7:6 of `bStatus`) is 00 (command processed).
+        pub fn is_success(&self) -> bool {
+            (self.status & 0xC0) == 0x00
+        }
+    }
+
+    /// An open CCID interface on a Rutoken ECP USB device.
+    ///
+    /// Discovered via [`CcidDevice::open`]. Each [`CcidDevice::transmit`] call sends one
+    /// `PC_to_RDR_XfrBlock` and receives one `RDR_to_PC_DataBlock`, keeping sequence numbers
+    /// monotonically incrementing per the CCID spec.
+    pub struct CcidDevice {
+        handle: rusb::DeviceHandle<GlobalContext>,
+        interface: u8,
+        bulk_in: u8,
+        bulk_out: u8,
+        slot: u8,
+        sequence: u8,
+        logger: Option<ExchangeLogger>,
+    }
+
+    impl CcidDevice {
+        /// Find and open the first Rutoken ECP device whose USB product string contains
+        /// `reader_filter` (when supplied), claim its CCID interface, and return a ready device.
+        pub fn open(reader_filter: Option<&str>) -> Result<Self, CliError> {
+            Self::open_with_exchange_log(reader_filter, None)
+        }
+
+        pub fn open_with_exchange_log(
+            reader_filter: Option<&str>,
+            exchange_log: Option<&Path>,
+        ) -> Result<Self, CliError> {
+            let devices = rusb::devices().map_err(|error| {
+                CliError::Message(format!("failed to enumerate USB devices: {error}"))
+            })?;
+
+            for device in devices.iter() {
+                let descriptor = match device.device_descriptor() {
+                    Ok(d) => d,
+                    Err(_) => continue,
+                };
+
+                if descriptor.vendor_id() != RUTOKEN_ECP3_USB_VID
+                    || descriptor.product_id() != RUTOKEN_ECP3_USB_PID
+                {
+                    continue;
+                }
+
+                let handle = match device.open() {
+                    Ok(h) => h,
+                    Err(error) => {
+                        return Err(CliError::Message(format!(
+                            "failed to open Rutoken USB device: {error}"
+                        )));
+                    }
+                };
+
+                if let Some(filter) = reader_filter {
+                    match handle.read_product_string_ascii(&descriptor) {
+                        Ok(ref product) if !product.contains(filter) => continue,
+                        Err(_) => continue,
+                        _ => {}
+                    }
+                }
+
+                let config = match device.active_config_descriptor() {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
+
+                for iface in config.interfaces() {
+                    for iface_desc in iface.descriptors() {
+                        if iface_desc.class_code() != CCID_CLASS {
+                            continue;
+                        }
+
+                        let interface_num = iface_desc.interface_number();
+                        let mut bulk_in: Option<u8> = None;
+                        let mut bulk_out: Option<u8> = None;
+
+                        for ep in iface_desc.endpoint_descriptors() {
+                            if ep.transfer_type() == TransferType::Bulk {
+                                match ep.direction() {
+                                    Direction::In => bulk_in = Some(ep.address()),
+                                    Direction::Out => bulk_out = Some(ep.address()),
+                                }
+                            }
+                        }
+
+                        let (Some(bulk_in), Some(bulk_out)) = (bulk_in, bulk_out) else {
+                            continue;
+                        };
+
+                        // On Linux, detach any kernel driver that claimed the interface.
+                        #[cfg(target_os = "linux")]
+                        let _ = handle.detach_kernel_driver(interface_num);
+
+                        handle.claim_interface(interface_num).map_err(|error| {
+                            CliError::Message(format!(
+                                "failed to claim CCID interface {interface_num}: {error}"
+                            ))
+                        })?;
+
+                        let mut logger = exchange_log.map(ExchangeLogger::create).transpose()?;
+                        if let Some(logger) = logger.as_mut() {
+                            logger.note(&format!(
+                                "opened vid=0x{:04x} pid=0x{:04x} interface={} bulk_in=0x{:02x} bulk_out=0x{:02x}",
+                                descriptor.vendor_id(),
+                                descriptor.product_id(),
+                                interface_num,
+                                bulk_in,
+                                bulk_out
+                            ))?;
+                        }
+
+                        return Ok(CcidDevice {
+                            handle,
+                            interface: interface_num,
+                            bulk_in,
+                            bulk_out,
+                            slot: 0,
+                            sequence: 0,
+                            logger,
+                        });
+                    }
+                }
+            }
+
+            Err(CliError::Message(
+                "Rutoken ECP device (VID 0x0a89 / PID 0x0030) not found. \
+                 Ensure the token is connected and you have access to the USB device."
+                    .to_string(),
+            ))
+        }
+
+        /// Power on the ICC and return the ATR bytes.
+        pub fn power_on(&mut self) -> Result<Vec<u8>, CliError> {
+            let seq = self.next_sequence();
+            let cmd = IccPowerOn::new(self.slot, seq);
+            let bytes = cmd.to_bytes();
+            self.log_bytes("out", "ccid", "PC_to_RDR_IccPowerOn", seq, &bytes, false)?;
+            self.handle
+                .write_bulk(self.bulk_out, &bytes, TRANSFER_TIMEOUT)
+                .map_err(|error| {
+                    CliError::Message(format!("CCID IccPowerOn write failed: {error}"))
+                })?;
+            let response = self.read_response("RDR_to_PC_DataBlock")?;
+            if !response.is_success() {
+                return Err(CliError::Message(format!(
+                    "CCID IccPowerOn failed: status=0x{:02x} error=0x{:02x}",
+                    response.status, response.error
+                )));
+            }
+            Ok(response.data)
+        }
+
+        /// Send an APDU via `PC_to_RDR_XfrBlock` and return the response APDU.
+        pub fn transmit(&mut self, apdu: &CommandApdu) -> Result<ResponseApdu, CliError> {
+            let seq = self.next_sequence();
+            let block = XfrBlock::new(self.slot, seq, apdu.clone());
+            let bytes = block.to_bytes()?;
+            let (apdu_log_bytes, apdu_redacted) = redacted_apdu_bytes_for_log(apdu)?;
+            self.log_bytes(
+                "out",
+                "apdu",
+                apdu_label(apdu),
+                seq,
+                &apdu_log_bytes,
+                apdu_redacted,
+            )?;
+            let (ccid_log_bytes, ccid_redacted) = redacted_ccid_block_for_log(apdu, &bytes);
+            self.log_bytes(
+                "out",
+                "ccid",
+                "PC_to_RDR_XfrBlock",
+                seq,
+                &ccid_log_bytes,
+                ccid_redacted,
+            )?;
+            self.handle
+                .write_bulk(self.bulk_out, &bytes, TRANSFER_TIMEOUT)
+                .map_err(|error| {
+                    CliError::Message(format!("CCID XfrBlock write failed: {error}"))
+                })?;
+            let response = self.read_response("RDR_to_PC_DataBlock")?;
+            if !response.is_success() {
+                return Err(CliError::Message(format!(
+                    "CCID XfrBlock failed: status=0x{:02x} error=0x{:02x}",
+                    response.status, response.error
+                )));
+            }
+            ResponseApdu::parse(&response.data)
+        }
+
+        pub fn exchange_log_path(&self) -> Option<&Path> {
+            self.logger.as_ref().map(ExchangeLogger::path)
+        }
+
+        fn next_sequence(&mut self) -> u8 {
+            let seq = self.sequence;
+            self.sequence = self.sequence.wrapping_add(1);
+            seq
+        }
+
+        fn read_response(&mut self, label: &str) -> Result<RdrDataBlock, CliError> {
+            // 10-byte CCID header + up to 258 bytes APDU response (256 data + 2 SW).
+            let mut buf = vec![0u8; 1024];
+            let n = self
+                .handle
+                .read_bulk(self.bulk_in, &mut buf, TRANSFER_TIMEOUT)
+                .map_err(|error| CliError::Message(format!("CCID bulk read failed: {error}")))?;
+            self.log_bytes(
+                "in",
+                "ccid",
+                label,
+                self.sequence.wrapping_sub(1),
+                &buf[..n],
+                false,
+            )?;
+            let response = RdrDataBlock::parse(&buf[..n])?;
+            if let Some(logger) = self.logger.as_mut() {
+                logger.response_summary(&response)?;
+                logger.flush()?;
+            }
+            Ok(response)
+        }
+
+        fn log_bytes(
+            &mut self,
+            direction: &str,
+            layer: &str,
+            label: &str,
+            sequence: u8,
+            bytes: &[u8],
+            redacted: bool,
+        ) -> Result<(), CliError> {
+            if let Some(logger) = self.logger.as_mut() {
+                logger.bytes(direction, layer, label, sequence, bytes, redacted)?;
+            }
+            Ok(())
+        }
+    }
+
+    impl Drop for CcidDevice {
+        fn drop(&mut self) {
+            let _ = self.handle.release_interface(self.interface);
+            #[cfg(target_os = "linux")]
+            let _ = self.handle.attach_kernel_driver(self.interface);
+        }
+    }
+
+    pub(crate) fn redacted_apdu_bytes_for_log(
+        apdu: &CommandApdu,
+    ) -> Result<(Vec<u8>, bool), CliError> {
+        let mut bytes = apdu.to_bytes()?;
+        let redacted = redact_verify_pin_data(&mut bytes, 0, apdu.data.len());
+        Ok((bytes, redacted))
+    }
+
+    pub(crate) fn redacted_ccid_block_for_log(apdu: &CommandApdu, bytes: &[u8]) -> (Vec<u8>, bool) {
+        let mut redacted = bytes.to_vec();
+        let did_redact = redact_verify_pin_data(&mut redacted, 10, apdu.data.len());
+        (redacted, did_redact)
+    }
+
+    fn redact_verify_pin_data(bytes: &mut [u8], apdu_offset: usize, data_len: usize) -> bool {
+        if data_len == 0 || bytes.len() < apdu_offset + 5 + data_len {
+            return false;
+        }
+        let ins = bytes[apdu_offset + 1];
+        if ins != 0x20 {
+            return false;
+        }
+        let data_offset = apdu_offset + 5;
+        for byte in &mut bytes[data_offset..data_offset + data_len] {
+            *byte = b'*';
+        }
+        true
+    }
+
+    pub(crate) fn apdu_label(apdu: &CommandApdu) -> &'static str {
+        match (apdu.cla, apdu.ins, apdu.p1, apdu.p2) {
+            (0x00, 0xA4, 0x00, 0x0C) => "SELECT_MF",
+            (0x00, 0x20, _, _) => "VERIFY_PIN",
+            (0x00, 0x22, 0x41, 0xB6) => "MSE_SET_DST",
+            (0x00, 0x2A, 0x9E, 0x9A) => "PSO_COMPUTE_DIGITAL_SIGNATURE",
+            _ => "APDU",
         }
     }
 }
@@ -143,6 +638,190 @@ pub mod gost {
 
     pub fn parse_digest(name: &str) -> Result<DigestAlgorithm, CliError> {
         DigestAlgorithm::parse(name)
+    }
+}
+
+/// Direct Rutoken ECP APDU sequences for hardware-backed GOST signing over CCID.
+///
+/// These helpers construct ISO 7816-4/8 APDUs for the operations needed to
+/// sign a digest with a GOST R 34.10-2012 private key stored on a Rutoken ECP
+/// token, following the same protocol as OpenSC's `card-rtecp.c`:
+///
+/// 1. SELECT MF (reset file system navigation)
+/// 2. VERIFY PIN (authenticate the user)
+/// 3. MSE SET (select the target private key via DST key reference)
+/// 4. PSO COMPUTE DIGITAL SIGNATURE (sign the pre-computed digest)
+pub mod rutoken {
+    use super::{CliError, apdu::CommandApdu};
+
+    #[derive(Debug, Clone)]
+    pub struct SelectSequence {
+        pub label: &'static str,
+        pub commands: Vec<CommandApdu>,
+    }
+
+    /// Rutoken ECP administrator/SO PIN reference (P2 for VERIFY).
+    pub const ADMIN_PIN_REFERENCE: u8 = 0x01;
+
+    /// Rutoken ECP user PIN reference (P2 for VERIFY).
+    pub const USER_PIN_REFERENCE: u8 = 0x02;
+
+    /// Parsed `rutoken:slot=N;id=XX` key URI used for the CCID transport path.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct RutokenUri {
+        /// Index into the CCID slot array (typically 0 for a single-slot reader).
+        pub slot: u8,
+        /// One-byte key object identifier, percent-decoded from the `id=` attribute.
+        pub id: u8,
+    }
+
+    impl RutokenUri {
+        /// Parse a `rutoken:slot=N;id=%XX` URI into its components.
+        pub fn parse(uri: &str) -> Result<Self, CliError> {
+            let attributes = uri.strip_prefix("rutoken:").ok_or_else(|| {
+                CliError::Usage("--key-uri must start with rutoken: for CCID transport".to_string())
+            })?;
+
+            let mut slot = 0u8;
+            let mut id: Option<u8> = None;
+
+            for pair in attributes.split(';').filter(|p| !p.is_empty()) {
+                let (name, value) = pair.split_once('=').ok_or_else(|| {
+                    CliError::Usage(format!("invalid rutoken URI attribute: {pair}"))
+                })?;
+                match name {
+                    "slot" => {
+                        slot = value.parse::<u8>().map_err(|error| {
+                            CliError::Usage(format!("invalid rutoken URI slot: {value} ({error})"))
+                        })?;
+                    }
+                    "id" => {
+                        let decoded = super::percent_decode_bytes(value)?;
+                        if decoded.len() != 1 {
+                            return Err(CliError::Usage(
+                                "rutoken URI id= must encode exactly one byte".to_string(),
+                            ));
+                        }
+                        id = Some(decoded[0]);
+                    }
+                    _ => {}
+                }
+            }
+
+            Ok(Self {
+                slot,
+                id: id.ok_or_else(|| {
+                    CliError::Usage(
+                        "rutoken URI must include id= to identify the private key".to_string(),
+                    )
+                })?,
+            })
+        }
+    }
+
+    /// SELECT File: Master File (3F00) — reset the DF navigation before further commands.
+    pub fn select_master_file() -> CommandApdu {
+        CommandApdu::new(0x00, 0xA4, 0x00, 0x0C).with_data([0x3F, 0x00])
+    }
+
+    /// SELECT File: Rutoken ECP private-key EF under 3F00/1000/1000/6002.
+    pub fn select_private_key_file(key_id: u8) -> CommandApdu {
+        CommandApdu::new(0x00, 0xA4, 0x08, 0x0C)
+            .with_data([0x10, 0x00, 0x10, 0x00, 0x60, 0x02, 0x00, key_id])
+    }
+
+    pub fn private_key_file_select_sequences(key_id: u8) -> Vec<SelectSequence> {
+        let pkcs15_private_key_id = 0x0100u16 | key_id as u16;
+        vec![
+            SelectSequence {
+                label: "PrKey-DF relative path",
+                commands: vec![select_private_key_file(key_id)],
+            },
+            SelectSequence {
+                label: "PrKey-DF absolute path",
+                commands: vec![select_file_by_path([
+                    0x3F, 0x00, 0x10, 0x00, 0x10, 0x00, 0x60, 0x02, 0x00, key_id,
+                ])],
+            },
+            SelectSequence {
+                label: "PrKey-DF stepwise file IDs",
+                commands: vec![
+                    select_file_by_id(0x1000),
+                    select_file_by_id(0x1000),
+                    select_file_by_id(0x6002),
+                    select_file_by_id(key_id as u16),
+                ],
+            },
+            SelectSequence {
+                label: "PKCS15-AppDF private-key path",
+                commands: vec![select_file_by_path([
+                    0x50,
+                    0x00,
+                    (pkcs15_private_key_id >> 8) as u8,
+                    pkcs15_private_key_id as u8,
+                ])],
+            },
+            SelectSequence {
+                label: "PKCS15-AppDF stepwise private-key file IDs",
+                commands: vec![
+                    select_file_by_id(0x5000),
+                    select_file_by_id(pkcs15_private_key_id),
+                ],
+            },
+        ]
+    }
+
+    fn select_file_by_path(path: impl Into<Vec<u8>>) -> CommandApdu {
+        CommandApdu::new(0x00, 0xA4, 0x08, 0x0C).with_data(path)
+    }
+
+    fn select_file_by_id(file_id: u16) -> CommandApdu {
+        CommandApdu::new(0x00, 0xA4, 0x00, 0x0C).with_data([(file_id >> 8) as u8, file_id as u8])
+    }
+
+    /// VERIFY — present the user PIN against `USER_PIN_REFERENCE`.
+    pub fn verify_pin(pin: &[u8]) -> CommandApdu {
+        CommandApdu::new(0x00, 0x20, 0x00, USER_PIN_REFERENCE).with_data(pin)
+    }
+
+    /// VERIFY status query used by OpenSC after Rutoken ECP reports `6300`.
+    pub fn verify_pin_status() -> CommandApdu {
+        CommandApdu::new(0x00, 0x20, 0x00, USER_PIN_REFERENCE)
+    }
+
+    /// Rutoken ECP logout command used by OpenSC before retrying VERIFY after `6f86`.
+    pub fn logout() -> CommandApdu {
+        CommandApdu::new(0x80, 0x40, 0x00, 0x00)
+    }
+
+    /// MSE SET (Manage Security Environment, SET, Digital Signature Template).
+    ///
+    /// Instructs the token to use the private key identified by `key_id` for the
+    /// next COMPUTE DIGITAL SIGNATURE command.
+    ///
+    /// Template TLV: `[84 01 key_id]` (Key Reference tag per ISO 7816-8 §5.2).
+    pub fn manage_security_environment_for_signing(key_id: u8) -> CommandApdu {
+        CommandApdu::new(0x00, 0x22, 0x41, 0xB6).with_data([0x84, 0x01, key_id])
+    }
+
+    /// PSO: COMPUTE DIGITAL SIGNATURE.
+    ///
+    /// Presents the pre-hashed `digest` bytes to the token in Rutoken ECP byte
+    /// order and requests a raw GOST R 34.10-2012 signature. `signature_len` is
+    /// 64 for 256-bit keys and 128 for 512-bit keys.
+    pub fn pso_compute_digital_signature(digest: &[u8], signature_len: u8) -> CommandApdu {
+        let mut token_digest = digest.to_vec();
+        token_digest.reverse();
+
+        CommandApdu::new(0x00, 0x2A, 0x9E, 0x9A)
+            .with_data(token_digest)
+            .with_le(signature_len)
+    }
+
+    /// Convert the Rutoken ECP signature byte order back to the caller-facing order.
+    pub fn signature_from_token(mut signature: Vec<u8>) -> Vec<u8> {
+        signature.reverse();
+        signature
     }
 }
 
@@ -324,7 +1003,10 @@ pub mod token {
         types::AuthPin,
     };
     use cryptoki_sys::CKM_GOSTR3410;
-    use std::path::{Path, PathBuf};
+    use std::{
+        env, fs,
+        path::{Path, PathBuf},
+    };
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct Pkcs11SignerConfig {
@@ -367,15 +1049,25 @@ pub mod token {
     pub struct CcidSignerConfig {
         pub reader: Option<String>,
         pub key_uri: String,
+        pub pin_env: Option<String>,
         pub key_algorithm: KeyAlgorithm,
+        pub exchange_log: Option<PathBuf>,
     }
 
     impl CcidSignerConfig {
-        pub fn new(reader: Option<String>, key_uri: String, key_algorithm: KeyAlgorithm) -> Self {
+        pub fn new(
+            reader: Option<String>,
+            key_uri: String,
+            pin_env: Option<String>,
+            key_algorithm: KeyAlgorithm,
+            exchange_log: Option<PathBuf>,
+        ) -> Self {
             Self {
                 reader,
                 key_uri,
+                pin_env,
                 key_algorithm,
+                exchange_log,
             }
         }
     }
@@ -462,11 +1154,140 @@ pub mod token {
                     digest.len()
                 )));
             }
-            Err(CliError::Message(
-                "Direct USB/CCID signing is not yet implemented. Hardware validation is required."
-                    .to_string(),
-            ))
+
+            let uri = super::rutoken::RutokenUri::parse(&self.key_uri)?;
+
+            let pin: Option<Vec<u8>> = self.pin_env.as_deref().map(load_pin_bytes).transpose()?;
+
+            sign_digest_direct(self, uri.id, pin.as_deref(), digest_algorithm, digest)
         }
+    }
+
+    fn sign_digest_direct(
+        config: &CcidSignerConfig,
+        key_id: u8,
+        pin: Option<&[u8]>,
+        digest_algorithm: DigestAlgorithm,
+        digest: &[u8],
+    ) -> Result<Vec<u8>, CliError> {
+        let mut device = super::ccid::CcidDevice::open_with_exchange_log(
+            config.reader.as_deref(),
+            config.exchange_log.as_deref(),
+        )?;
+        device.power_on()?;
+
+        let resp = device.transmit(&super::rutoken::select_master_file())?;
+        if !resp.is_success() {
+            return Err(CliError::Message(format!(
+                "SELECT MF failed: SW {:02x}{:02x}",
+                resp.sw1, resp.sw2
+            )));
+        }
+
+        if let Some(pin_bytes) = pin {
+            let mut resp = device.transmit(&super::rutoken::verify_pin(pin_bytes))?;
+            if resp.sw1 == 0x6F && resp.sw2 == 0x86 {
+                let logout = device.transmit(&super::rutoken::logout())?;
+                if !logout.is_success() {
+                    return Err(CliError::Message(format!(
+                        "LOGOUT failed after VERIFY returned 6f86: SW {:02x}{:02x}",
+                        logout.sw1, logout.sw2
+                    )));
+                }
+                resp = device.transmit(&super::rutoken::verify_pin(pin_bytes))?;
+            }
+            if !resp.is_success() {
+                let resp = if resp.sw1 == 0x63 && resp.sw2 == 0x00 {
+                    device.transmit(&super::rutoken::verify_pin_status())?
+                } else {
+                    resp
+                };
+                return Err(CliError::Message(format!(
+                    "VERIFY PIN failed: SW {:02x}{:02x}",
+                    resp.sw1, resp.sw2
+                )));
+            }
+        }
+
+        select_private_key_file(&mut device, key_id)?;
+
+        let resp = device.transmit(&super::rutoken::manage_security_environment_for_signing(
+            key_id,
+        ))?;
+        if !resp.is_success() {
+            return Err(CliError::Message(format!(
+                "MSE SET (key reference 0x{key_id:02x}) failed: SW {:02x}{:02x}",
+                resp.sw1, resp.sw2
+            )));
+        }
+
+        let signature_len = match digest_algorithm {
+            DigestAlgorithm::Gost3411_2012_256 => 64u8,
+            DigestAlgorithm::Gost3411_2012_512 => 128u8,
+            _ => {
+                return Err(CliError::Message(format!(
+                    "CCID/Rutoken transport only supports GOST digests, got {}",
+                    digest_algorithm.name()
+                )));
+            }
+        };
+        let resp = device.transmit(&super::rutoken::pso_compute_digital_signature(
+            digest,
+            signature_len,
+        ))?;
+        if !resp.is_success() {
+            return Err(CliError::Message(format!(
+                "PSO COMPUTE DIGITAL SIGNATURE failed: SW {:02x}{:02x}",
+                resp.sw1, resp.sw2
+            )));
+        }
+
+        if resp.data.len() != signature_len as usize {
+            return Err(CliError::Message(format!(
+                "CCID signature length mismatch: expected {} bytes, token returned {}",
+                signature_len,
+                resp.data.len()
+            )));
+        }
+
+        Ok(super::rutoken::signature_from_token(resp.data))
+    }
+
+    fn select_private_key_file(
+        device: &mut super::ccid::CcidDevice,
+        key_id: u8,
+    ) -> Result<(), CliError> {
+        let mut failures = Vec::new();
+        for sequence in super::rutoken::private_key_file_select_sequences(key_id) {
+            let reset = device.transmit(&super::rutoken::select_master_file())?;
+            if !reset.is_success() {
+                return Err(CliError::Message(format!(
+                    "SELECT MF before private key selection failed: SW {:02x}{:02x}",
+                    reset.sw1, reset.sw2
+                )));
+            }
+
+            let mut selected = true;
+            for apdu in sequence.commands {
+                let resp = device.transmit(&apdu)?;
+                if !resp.is_success() {
+                    failures.push(format!(
+                        "{} -> {:02x}{:02x}",
+                        sequence.label, resp.sw1, resp.sw2
+                    ));
+                    selected = false;
+                    break;
+                }
+            }
+            if selected {
+                return Ok(());
+            }
+        }
+
+        Err(CliError::Message(format!(
+            "SELECT private key file (key reference 0x{key_id:02x}) failed: {}",
+            failures.join(", ")
+        )))
     }
 
     pub fn ensure_module_path(path: &Path) -> Result<(), CliError> {
@@ -516,7 +1337,7 @@ pub mod token {
                             ))
                         })?)
                     }
-                    "id" => selector.id = Some(percent_decode_bytes(value)?),
+                    "id" => selector.id = Some(super::percent_decode_bytes(value)?),
                     "object" => selector.object = Some(percent_decode_text(value)?),
                     _ => {}
                 }
@@ -666,54 +1487,62 @@ pub mod token {
     }
 
     fn load_pin(name: &str) -> Result<AuthPin, CliError> {
-        std::env::var(name)
-            .map(|pin| AuthPin::new(pin.into()))
-            .map_err(|error| {
-                CliError::Usage(format!(
-                    "--pin-env variable {name} is not set or contains invalid UTF-8: {error}"
-                ))
-            })
+        load_env_value(name).map(|pin| AuthPin::new(pin.into()))
+    }
+
+    fn load_pin_bytes(name: &str) -> Result<Vec<u8>, CliError> {
+        load_env_value(name).map(String::into_bytes)
+    }
+
+    fn load_env_value(name: &str) -> Result<String, CliError> {
+        match env::var(name) {
+            Ok(value) => return Ok(value),
+            Err(env::VarError::NotUnicode(_)) => {
+                return Err(CliError::Usage(format!(
+                    "--pin-env variable {name} contains invalid UTF-8"
+                )));
+            }
+            Err(env::VarError::NotPresent) => {}
+        }
+
+        let Ok(contents) = fs::read_to_string(".env") else {
+            return Err(CliError::Usage(format!(
+                "--pin-env variable {name} is not set and .env was not found"
+            )));
+        };
+
+        for line in contents.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            if key.trim() == name {
+                return Ok(unquote_env_value(value.trim()).to_string());
+            }
+        }
+
+        Err(CliError::Usage(format!(
+            "--pin-env variable {name} is not set in the environment or .env"
+        )))
+    }
+
+    fn unquote_env_value(value: &str) -> &str {
+        if value.len() >= 2
+            && ((value.starts_with('"') && value.ends_with('"'))
+                || (value.starts_with('\'') && value.ends_with('\'')))
+        {
+            &value[1..value.len() - 1]
+        } else {
+            value
+        }
     }
 
     fn percent_decode_text(value: &str) -> Result<String, CliError> {
-        String::from_utf8(percent_decode_bytes(value)?)
+        String::from_utf8(super::percent_decode_bytes(value)?)
             .map_err(|_| CliError::Usage("PKCS#11 URI contains non-UTF-8 text".to_string()))
-    }
-
-    fn percent_decode_bytes(value: &str) -> Result<Vec<u8>, CliError> {
-        let bytes = value.as_bytes();
-        let mut decoded = Vec::with_capacity(bytes.len());
-        let mut index = 0;
-        while index < bytes.len() {
-            if bytes[index] == b'%' {
-                if index + 2 >= bytes.len() {
-                    return Err(CliError::Usage(format!(
-                        "invalid percent escape in PKCS#11 URI: {value}"
-                    )));
-                }
-                let high = hex_nibble(bytes[index + 1]).ok_or_else(|| {
-                    CliError::Usage(format!("invalid percent escape in PKCS#11 URI: {value}"))
-                })?;
-                let low = hex_nibble(bytes[index + 2]).ok_or_else(|| {
-                    CliError::Usage(format!("invalid percent escape in PKCS#11 URI: {value}"))
-                })?;
-                decoded.push((high << 4) | low);
-                index += 3;
-            } else {
-                decoded.push(bytes[index]);
-                index += 1;
-            }
-        }
-        Ok(decoded)
-    }
-
-    fn hex_nibble(byte: u8) -> Option<u8> {
-        match byte {
-            b'0'..=b'9' => Some(byte - b'0'),
-            b'a'..=b'f' => Some(byte - b'a' + 10),
-            b'A'..=b'F' => Some(byte - b'A' + 10),
-            _ => None,
-        }
     }
 }
 
@@ -932,8 +1761,27 @@ pub struct SignCommand {
     pub pkcs11_module: Option<PathBuf>,
     pub pin_env: Option<String>,
     pub ccid_reader: Option<String>,
+    pub exchange_log: Option<PathBuf>,
     pub embed_content: bool,
     pub dry_run: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CcidProbeCommand {
+    pub ccid_reader: Option<String>,
+    pub exchange_log: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CcidRawSignCommand {
+    pub input: PathBuf,
+    pub output: PathBuf,
+    pub key_uri: String,
+    pub digest: DigestAlgorithm,
+    pub key_algorithm: KeyAlgorithm,
+    pub pin_env: String,
+    pub ccid_reader: Option<String>,
+    pub exchange_log: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -970,6 +1818,14 @@ where
             let sign_command = SignCommand::parse(args)?;
             sign_command.run()
         }
+        Some(command) if command == "ccid-probe" => {
+            let command = CcidProbeCommand::parse(args)?;
+            command.run()
+        }
+        Some(command) if command == "ccid-sign-raw" => {
+            let command = CcidRawSignCommand::parse(args)?;
+            command.run()
+        }
         Some(command) => Err(CliError::Usage(format!(
             "unknown command: {}\n\n{}",
             command.to_string_lossy(),
@@ -993,6 +1849,7 @@ impl SignCommand {
         let mut pkcs11_module = None;
         let mut pin_env = None;
         let mut ccid_reader = None;
+        let mut exchange_log = None;
         let mut embed_content = false;
         let mut dry_run = false;
 
@@ -1042,6 +1899,9 @@ impl SignCommand {
                             .into(),
                     )
                 }
+                "--exchange-log" => {
+                    exchange_log = Some(PathBuf::from(next_value(&mut iter, "--exchange-log")?))
+                }
                 "--embed-content" => embed_content = true,
                 "--dry-run" => dry_run = true,
                 "--help" | "-h" => return Err(CliError::Usage(usage())),
@@ -1068,6 +1928,7 @@ impl SignCommand {
             pkcs11_module,
             pin_env,
             ccid_reader,
+            exchange_log,
             embed_content,
             dry_run,
         };
@@ -1087,18 +1948,39 @@ impl SignCommand {
             ));
         }
 
-        if self.transport == Transport::Pkcs11 {
-            let Some(module) = &self.pkcs11_module else {
-                return Err(CliError::Usage(
-                    String::from("--pkcs11-module is required for --transport pkcs11\n\n")
-                        + &usage(),
-                ));
-            };
-            token::ensure_module_path(module)?;
-            if !self.dry_run && self.pin_env.is_none() {
-                return Err(CliError::Usage(
-                    String::from("--pin-env is required for live PKCS#11 signing\n\n") + &usage(),
-                ));
+        self.key_algorithm.signature_oid(self.digest)?;
+
+        match self.transport {
+            Transport::Pkcs11 => {
+                let Some(module) = &self.pkcs11_module else {
+                    return Err(CliError::Usage(
+                        String::from("--pkcs11-module is required for --transport pkcs11\n\n")
+                            + &usage(),
+                    ));
+                };
+                token::ensure_module_path(module)?;
+                if !self.dry_run && self.pin_env.is_none() {
+                    return Err(CliError::Usage(
+                        String::from("--pin-env is required for live PKCS#11 signing\n\n")
+                            + &usage(),
+                    ));
+                }
+            }
+            Transport::Ccid => {
+                rutoken::RutokenUri::parse(&self.key_uri)?;
+                match (self.digest, self.key_algorithm) {
+                    (DigestAlgorithm::Gost3411_2012_256, KeyAlgorithm::Gost3410_2012_256)
+                    | (DigestAlgorithm::Gost3411_2012_512, KeyAlgorithm::Gost3410_2012_512) => {}
+                    _ => {
+                        return Err(CliError::Usage(
+                            String::from(
+                                "--transport ccid currently supports only Rutoken GOST signing; \
+                                 use --digest gost12-256/512 with the matching \
+                                 --key-algorithm gost3410-2012-256/512\n\n",
+                            ) + &usage(),
+                        ));
+                    }
+                }
             }
         }
 
@@ -1146,7 +2028,9 @@ impl SignCommand {
                 let signer = token::CcidSignerConfig::new(
                     self.ccid_reader.clone(),
                     self.key_uri.clone(),
+                    self.pin_env.clone(),
                     self.key_algorithm,
+                    self.exchange_log.clone(),
                 );
                 token::TokenSigner::sign_digest(&signer, self.digest, &digest)
             }
@@ -1186,6 +2070,9 @@ impl SignCommand {
                 if let Some(reader) = &self.ccid_reader {
                     lines.push(format!("ccid_reader={reader}"));
                 }
+                if let Some(exchange_log) = &self.exchange_log {
+                    lines.push(format!("exchange_log={}", exchange_log.display()));
+                }
             }
         }
 
@@ -1196,6 +2083,199 @@ impl SignCommand {
         }
 
         lines.join("\n")
+    }
+}
+
+impl CcidProbeCommand {
+    fn parse<I>(args: I) -> Result<Self, CliError>
+    where
+        I: IntoIterator<Item = OsString>,
+    {
+        let mut ccid_reader = None;
+        let mut exchange_log = None;
+
+        let mut iter = args.into_iter();
+        while let Some(arg) = iter.next() {
+            match arg.to_string_lossy().as_ref() {
+                "--ccid-reader" => {
+                    ccid_reader = Some(
+                        next_value(&mut iter, "--ccid-reader")?
+                            .to_string_lossy()
+                            .into(),
+                    )
+                }
+                "--exchange-log" => {
+                    exchange_log = Some(PathBuf::from(next_value(&mut iter, "--exchange-log")?))
+                }
+                "--help" | "-h" => return Err(CliError::Usage(usage())),
+                flag => {
+                    return Err(CliError::Usage(format!(
+                        "unknown option: {flag}\n\n{}",
+                        usage()
+                    )));
+                }
+            }
+        }
+
+        Ok(Self {
+            ccid_reader,
+            exchange_log,
+        })
+    }
+
+    pub fn run(&self) -> Result<String, CliError> {
+        self.run_direct()
+    }
+
+    fn run_direct(&self) -> Result<String, CliError> {
+        let mut device = ccid::CcidDevice::open_with_exchange_log(
+            self.ccid_reader.as_deref(),
+            self.exchange_log.as_deref(),
+        )?;
+        let atr = device.power_on()?;
+        let select = device.transmit(&rutoken::select_master_file())?;
+
+        let mut lines = vec![
+            "ccid probe".to_string(),
+            format!("atr_hex={}", hex_encode(&atr)),
+            format!("select_mf_sw={:02x}{:02x}", select.sw1, select.sw2),
+        ];
+        if let Some(path) = device.exchange_log_path() {
+            lines.push(format!("exchange_log={}", path.display()));
+        }
+        Ok(lines.join("\n"))
+    }
+}
+
+impl CcidRawSignCommand {
+    fn parse<I>(args: I) -> Result<Self, CliError>
+    where
+        I: IntoIterator<Item = OsString>,
+    {
+        let mut input = None;
+        let mut output = None;
+        let mut key_uri = None;
+        let mut digest = DigestAlgorithm::Gost3411_2012_256;
+        let mut key_algorithm_override: Option<KeyAlgorithm> = None;
+        let mut pin_env = None;
+        let mut ccid_reader = None;
+        let mut exchange_log = None;
+
+        let mut iter = args.into_iter();
+        while let Some(arg) = iter.next() {
+            match arg.to_string_lossy().as_ref() {
+                "--input" => input = Some(PathBuf::from(next_value(&mut iter, "--input")?)),
+                "--output" => output = Some(PathBuf::from(next_value(&mut iter, "--output")?)),
+                "--key-uri" => {
+                    key_uri = Some(next_value(&mut iter, "--key-uri")?.to_string_lossy().into())
+                }
+                "--digest" => {
+                    digest = DigestAlgorithm::parse(
+                        next_value(&mut iter, "--digest")?
+                            .to_string_lossy()
+                            .as_ref(),
+                    )?
+                }
+                "--key-algorithm" => {
+                    key_algorithm_override = Some(KeyAlgorithm::parse(
+                        next_value(&mut iter, "--key-algorithm")?
+                            .to_string_lossy()
+                            .as_ref(),
+                    )?)
+                }
+                "--pin-env" => {
+                    pin_env = Some(
+                        next_value(&mut iter, "--pin-env")?
+                            .to_string_lossy()
+                            .into_owned(),
+                    )
+                }
+                "--ccid-reader" => {
+                    ccid_reader = Some(
+                        next_value(&mut iter, "--ccid-reader")?
+                            .to_string_lossy()
+                            .into(),
+                    )
+                }
+                "--exchange-log" => {
+                    exchange_log = Some(PathBuf::from(next_value(&mut iter, "--exchange-log")?))
+                }
+                "--help" | "-h" => return Err(CliError::Usage(usage())),
+                flag => {
+                    return Err(CliError::Usage(format!(
+                        "unknown option: {flag}\n\n{}",
+                        usage()
+                    )));
+                }
+            }
+        }
+
+        let key_algorithm =
+            key_algorithm_override.unwrap_or_else(|| KeyAlgorithm::default_for_digest(digest));
+        let command = Self {
+            input: required_path(input, "--input")?,
+            output: required_path(output, "--output")?,
+            key_uri: required_string(key_uri, "--key-uri")?,
+            digest,
+            key_algorithm,
+            pin_env: required_string(pin_env, "--pin-env")?,
+            ccid_reader,
+            exchange_log,
+        };
+        command.validate()?;
+        Ok(command)
+    }
+
+    fn validate(&self) -> Result<(), CliError> {
+        ensure_file_exists(&self.input, "--input")?;
+        ensure_parent_exists(&self.output, "--output")?;
+        rutoken::RutokenUri::parse(&self.key_uri)?;
+        match (self.digest, self.key_algorithm) {
+            (DigestAlgorithm::Gost3411_2012_256, KeyAlgorithm::Gost3410_2012_256)
+            | (DigestAlgorithm::Gost3411_2012_512, KeyAlgorithm::Gost3410_2012_512) => Ok(()),
+            _ => Err(CliError::Usage(
+                String::from(
+                    "ccid-sign-raw supports only Rutoken GOST signing; use --digest \
+                     gost12-256/512 with the matching --key-algorithm \
+                     gost3410-2012-256/512\n\n",
+                ) + &usage(),
+            )),
+        }
+    }
+
+    pub fn run(&self) -> Result<String, CliError> {
+        let document = fs::read(&self.input).map_err(|error| {
+            CliError::Message(format!(
+                "failed to read --input {}: {error}",
+                self.input.display()
+            ))
+        })?;
+        let digest = compute_digest(&document, self.digest);
+        let signer = token::CcidSignerConfig::new(
+            self.ccid_reader.clone(),
+            self.key_uri.clone(),
+            Some(self.pin_env.clone()),
+            self.key_algorithm,
+            self.exchange_log.clone(),
+        );
+        let signature = token::TokenSigner::sign_digest(&signer, self.digest, &digest)?;
+        fs::write(&self.output, &signature).map_err(|error| {
+            CliError::Message(format!(
+                "failed to write --output {}: {error}",
+                self.output.display()
+            ))
+        })?;
+
+        let mut lines = vec![
+            format!("wrote raw signature to {}", self.output.display()),
+            format!("digest_algorithm={}", self.digest.cli_name()),
+            format!("digest_hex={}", hex_encode(&digest)),
+            format!("signature_len={}", signature.len()),
+        ];
+        if let Some(exchange_log) = &self.exchange_log {
+            lines.push(format!("exchange_log={}", exchange_log.display()));
+        }
+        Ok(lines.join("\n"))
     }
 }
 
@@ -1250,14 +2330,65 @@ fn hex_encode(bytes: &[u8]) -> String {
     output
 }
 
+/// Decode a percent-encoded byte string from a PKCS#11 or `rutoken:` URI component.
+///
+/// Used by both [`token::KeyUriSelector`] (for `pkcs11:` URIs) and
+/// [`rutoken::RutokenUri`] (for `rutoken:` URIs).
+fn percent_decode_bytes(value: &str) -> Result<Vec<u8>, CliError> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            if index + 2 >= bytes.len() {
+                return Err(CliError::Usage(format!(
+                    "incomplete percent escape at end of URI value: {value}"
+                )));
+            }
+            let high = hex_nibble(bytes[index + 1]).ok_or_else(|| {
+                CliError::Usage(format!(
+                    "invalid hex character '{}' in percent escape in URI value: {value}",
+                    bytes[index + 1] as char
+                ))
+            })?;
+            let low = hex_nibble(bytes[index + 2]).ok_or_else(|| {
+                CliError::Usage(format!(
+                    "invalid hex character '{}' in percent escape in URI value: {value}",
+                    bytes[index + 2] as char
+                ))
+            })?;
+            decoded.push((high << 4) | low);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    Ok(decoded)
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
 fn usage() -> String {
     String::from(
-        "cryptokiddie sign --input <FILE> --output <FILE> --cert <FILE> --key-uri <URI> [options]\n\
+        "cryptokiddie <command> [options]\n\
          \n\
          Native Rust signing pipeline for PKCS#11 token-backed keys.\n\
          The document is hashed in-process; the token is responsible for the hardware\n\
          signature; CMS SignedData construction is kept behind the RustCrypto cms crate\n\
          boundary.\n\
+                 \n\
+                 Commands:\n\
+                     sign                    Build a CMS signature using PKCS#11 or direct CCID\n\
+                     ccid-probe              Open the Rutoken CCID interface and log ATR/SELECT MF\n\
+                     ccid-sign-raw           Sign a document digest over direct CCID and write raw bytes\n\
          \n\
          Options:\n\
            --digest <NAME>           Hash algorithm: gost12-256 (default), gost12-512,\n\
@@ -1269,6 +2400,7 @@ fn usage() -> String {
            --pkcs11-module <FILE>    PKCS#11 module used by the cryptoki Rust crate\n\
            --pin-env <NAME>          Read the user PIN from an environment variable\n\
            --ccid-reader <NAME>      CCID reader selector for direct USB/APDU work\n\
+           --exchange-log <FILE>     Write a redacted direct CCID/APDU exchange log\n\
            --embed-content           Produce an attached CMS object after signing\n\
            --dry-run                 Hash input and print the native signing plan\n\
          \n\
@@ -1287,8 +2419,8 @@ fn usage() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        CliError, DigestAlgorithm, KeyAlgorithm, SignCommand, Transport, apdu, ccid, cms_envelope,
-        compute_digest, gost, run_cli, token,
+        CcidProbeCommand, CcidRawSignCommand, CliError, DigestAlgorithm, KeyAlgorithm, SignCommand,
+        Transport, apdu, ccid, cms_envelope, compute_digest, gost, run_cli, rutoken, token,
     };
     use std::{
         env,
@@ -1328,6 +2460,37 @@ mod tests {
         assert_eq!(command.transport, Transport::Pkcs11);
         assert_eq!(command.pkcs11_module.as_deref(), Some(module.as_path()));
         assert_eq!(command.pin_env, None);
+    }
+
+    #[test]
+    fn parses_sign_command_exchange_log() {
+        let temp = TempDir::new();
+        let input = temp.write_file("document.txt", "hello");
+        let cert = temp.write_file("signer.der", "certificate");
+        let output = temp.path().join("document.txt.p7s");
+        let exchange_log = temp.path().join("ccid.log");
+
+        let command = SignCommand::parse([
+            OsString::from("--input"),
+            input.into_os_string(),
+            OsString::from("--output"),
+            output.into_os_string(),
+            OsString::from("--cert"),
+            cert.into_os_string(),
+            OsString::from("--key-uri"),
+            OsString::from("rutoken:slot=0;id=%01"),
+            OsString::from("--transport"),
+            OsString::from("ccid"),
+            OsString::from("--exchange-log"),
+            exchange_log.clone().into_os_string(),
+            OsString::from("--dry-run"),
+        ])
+        .expect("command should parse");
+
+        assert_eq!(
+            command.exchange_log.as_deref(),
+            Some(exchange_log.as_path())
+        );
     }
 
     #[test]
@@ -1537,7 +2700,7 @@ mod tests {
             OsString::from("--cert"),
             cert.into_os_string(),
             OsString::from("--key-uri"),
-            OsString::from("pkcs11:slot=0;id=%01"),
+            OsString::from("rutoken:slot=0;id=%01"),
             OsString::from("--transport"),
             OsString::from("ccid"),
             OsString::from("--ccid-reader"),
@@ -1550,6 +2713,58 @@ mod tests {
         assert!(output.contains("ccid_reader=Alcor Micro AU9560"));
         assert!(!output.contains("vid="));
         assert!(!output.contains("pid="));
+    }
+
+    #[test]
+    fn ccid_transport_requires_rutoken_key_uri() {
+        let temp = TempDir::new();
+        let input = temp.write_file("document.txt", "hello");
+        let cert = temp.write_file("signer.der", "certificate");
+        let output = temp.path().join("document.txt.p7s");
+
+        let error = SignCommand::parse([
+            OsString::from("--input"),
+            input.into_os_string(),
+            OsString::from("--output"),
+            output.into_os_string(),
+            OsString::from("--cert"),
+            cert.into_os_string(),
+            OsString::from("--key-uri"),
+            OsString::from("pkcs11:slot=0;id=%01"),
+            OsString::from("--transport"),
+            OsString::from("ccid"),
+            OsString::from("--dry-run"),
+        ])
+        .expect_err("CCID transport should require rutoken: key URIs");
+
+        assert!(matches!(error, CliError::Usage(message) if message.contains("rutoken:")));
+    }
+
+    #[test]
+    fn ccid_transport_rejects_non_gost_signing() {
+        let temp = TempDir::new();
+        let input = temp.write_file("document.txt", "hello");
+        let cert = temp.write_file("signer.der", "certificate");
+        let output = temp.path().join("document.txt.p7s");
+
+        let error = SignCommand::parse([
+            OsString::from("--input"),
+            input.into_os_string(),
+            OsString::from("--output"),
+            output.into_os_string(),
+            OsString::from("--cert"),
+            cert.into_os_string(),
+            OsString::from("--key-uri"),
+            OsString::from("rutoken:slot=0;id=%01"),
+            OsString::from("--transport"),
+            OsString::from("ccid"),
+            OsString::from("--digest"),
+            OsString::from("sha256"),
+            OsString::from("--dry-run"),
+        ])
+        .expect_err("CCID transport should reject non-GOST signing");
+
+        assert!(matches!(error, CliError::Usage(message) if message.contains("Rutoken GOST")));
     }
 
     #[test]
@@ -1829,6 +3044,330 @@ mod tests {
             .expect_err("empty signatures should fail");
 
         assert!(matches!(error, CliError::Message(message) if message.contains("signature")));
+    }
+
+    // --- rutoken URI parsing ---
+
+    #[test]
+    fn rutoken_uri_parses_slot_and_id() {
+        let uri =
+            rutoken::RutokenUri::parse("rutoken:slot=0;id=%01").expect("rutoken URI should parse");
+
+        assert_eq!(uri.slot, 0);
+        assert_eq!(uri.id, 0x01);
+    }
+
+    #[test]
+    fn rutoken_uri_parses_non_zero_slot_and_multi_hex_id() {
+        let uri =
+            rutoken::RutokenUri::parse("rutoken:slot=2;id=%0f").expect("rutoken URI should parse");
+
+        assert_eq!(uri.slot, 2);
+        assert_eq!(uri.id, 0x0f);
+    }
+
+    #[test]
+    fn rutoken_uri_requires_id_attribute() {
+        let error =
+            rutoken::RutokenUri::parse("rutoken:slot=0").expect_err("missing id= should fail");
+
+        assert!(matches!(error, CliError::Usage(msg) if msg.contains("id=")));
+    }
+
+    #[test]
+    fn rutoken_uri_rejects_non_rutoken_prefix() {
+        let error = rutoken::RutokenUri::parse("pkcs11:slot=0;id=%01")
+            .expect_err("wrong scheme should fail");
+
+        assert!(matches!(error, CliError::Usage(msg) if msg.contains("rutoken:")));
+    }
+
+    #[test]
+    fn rutoken_uri_rejects_multi_byte_id() {
+        let error = rutoken::RutokenUri::parse("rutoken:slot=0;id=%01%02")
+            .expect_err("two-byte id should fail");
+
+        assert!(matches!(error, CliError::Usage(msg) if msg.contains("one byte")));
+    }
+
+    // --- Rutoken APDU constructors ---
+
+    #[test]
+    fn rutoken_select_master_file_apdu() {
+        let apdu = rutoken::select_master_file();
+
+        assert_eq!(
+            apdu.to_bytes().expect("APDU should serialize"),
+            vec![0x00, 0xA4, 0x00, 0x0C, 0x02, 0x3F, 0x00]
+        );
+    }
+
+    #[test]
+    fn rutoken_select_private_key_file_apdu() {
+        let apdu = rutoken::select_private_key_file(0x01);
+
+        assert_eq!(
+            apdu.to_bytes().expect("APDU should serialize"),
+            vec![
+                0x00, 0xA4, 0x08, 0x0C, 0x08, 0x10, 0x00, 0x10, 0x00, 0x60, 0x02, 0x00, 0x01,
+            ]
+        );
+    }
+
+    #[test]
+    fn rutoken_verify_pin_apdu() {
+        let pin = b"12345678";
+        let apdu = rutoken::verify_pin(pin);
+
+        let bytes = apdu.to_bytes().expect("APDU should serialize");
+        assert_eq!(&bytes[..4], [0x00, 0x20, 0x00, rutoken::USER_PIN_REFERENCE]);
+        assert_eq!(bytes[4] as usize, pin.len());
+        assert_eq!(&bytes[5..], pin);
+    }
+
+    #[test]
+    fn rutoken_pin_references_match_aktiv_apdu_samples() {
+        assert_eq!(rutoken::ADMIN_PIN_REFERENCE, 0x01);
+        assert_eq!(rutoken::USER_PIN_REFERENCE, 0x02);
+    }
+
+    #[test]
+    fn rutoken_verify_pin_status_apdu() {
+        let apdu = rutoken::verify_pin_status();
+
+        assert_eq!(
+            apdu.to_bytes().expect("APDU should serialize"),
+            vec![0x00, 0x20, 0x00, rutoken::USER_PIN_REFERENCE]
+        );
+    }
+
+    #[test]
+    fn rutoken_logout_apdu() {
+        let apdu = rutoken::logout();
+
+        assert_eq!(
+            apdu.to_bytes().expect("APDU should serialize"),
+            vec![0x80, 0x40, 0x00, 0x00]
+        );
+    }
+
+    #[test]
+    fn rutoken_mse_set_apdu_embeds_key_reference() {
+        let apdu = rutoken::manage_security_environment_for_signing(0x01);
+
+        assert_eq!(
+            apdu.to_bytes().expect("APDU should serialize"),
+            vec![0x00, 0x22, 0x41, 0xB6, 0x03, 0x84, 0x01, 0x01]
+        );
+    }
+
+    #[test]
+    fn rutoken_pso_cds_apdu_for_gost256() {
+        let digest = (0u8..32).collect::<Vec<_>>();
+        let apdu = rutoken::pso_compute_digital_signature(&digest, 64);
+        let bytes = apdu.to_bytes().expect("APDU should serialize");
+        let expected_digest = (0u8..32).rev().collect::<Vec<_>>();
+
+        // CLA INS P1 P2 Lc=32 reversed digest[0..32] Le=64
+        assert_eq!(&bytes[..4], [0x00, 0x2A, 0x9E, 0x9A]);
+        assert_eq!(bytes[4], 32);
+        assert_eq!(&bytes[5..37], expected_digest.as_slice());
+        assert_eq!(bytes[37], 64);
+    }
+
+    #[test]
+    fn rutoken_pso_cds_apdu_for_gost512() {
+        let digest = (0u8..64).collect::<Vec<_>>();
+        let apdu = rutoken::pso_compute_digital_signature(&digest, 128);
+        let bytes = apdu.to_bytes().expect("APDU should serialize");
+        let expected_digest = (0u8..64).rev().collect::<Vec<_>>();
+
+        assert_eq!(&bytes[..4], [0x00, 0x2A, 0x9E, 0x9A]);
+        assert_eq!(bytes[4], 64);
+        assert_eq!(bytes[5..69], expected_digest[..]);
+        assert_eq!(bytes[69], 128);
+    }
+
+    #[test]
+    fn rutoken_signature_from_token_reverses_bytes() {
+        assert_eq!(
+            rutoken::signature_from_token(vec![1, 2, 3, 4]),
+            vec![4, 3, 2, 1]
+        );
+    }
+
+    // --- CCID protocol types ---
+
+    #[test]
+    fn ccid_icc_power_on_serializes() {
+        let cmd = ccid::IccPowerOn::new(0, 3);
+
+        assert_eq!(
+            cmd.to_bytes(),
+            vec![
+                ccid::PC_TO_RDR_ICCPOWERON,
+                0x00,
+                0x00,
+                0x00,
+                0x00, // dwLength = 0
+                0x00, // bSlot = 0
+                0x03, // bSeq = 3
+                0x00, // bPowerSelect = automatic
+                0x00,
+                0x00, // abRFU
+            ]
+        );
+    }
+
+    #[test]
+    fn ccid_rdr_data_block_parses_success_response() {
+        // Construct a minimal success RDR_to_PC_DataBlock carrying SW 9000.
+        let mut bytes = vec![
+            ccid::RDR_TO_PC_DATABLOCK,
+            0x02,
+            0x00,
+            0x00,
+            0x00, // dwLength = 2
+            0x00, // bSlot
+            0x01, // bSeq
+            0x00, // bStatus (success)
+            0x00, // bError
+            0x00, // bChainParameter
+        ];
+        bytes.extend_from_slice(&[0x90, 0x00]); // SW 9000
+
+        let block = ccid::RdrDataBlock::parse(&bytes).expect("should parse");
+        assert!(block.is_success());
+        assert_eq!(block.sequence, 1);
+        assert_eq!(block.data, vec![0x90, 0x00]);
+    }
+
+    #[test]
+    fn ccid_rdr_data_block_detects_command_error() {
+        let bytes = vec![
+            ccid::RDR_TO_PC_DATABLOCK,
+            0x00,
+            0x00,
+            0x00,
+            0x00, // dwLength = 0
+            0x00, // bSlot
+            0x02, // bSeq
+            0x40, // bStatus: bmCommandStatus = 01 (failed)
+            0xE0, // bError
+            0x00, // bChainParameter
+        ];
+
+        let block = ccid::RdrDataBlock::parse(&bytes).expect("should parse");
+        assert!(!block.is_success());
+    }
+
+    #[test]
+    fn ccid_rdr_data_block_rejects_wrong_message_type() {
+        let bytes = vec![
+            0x81, // RDR_to_PC_SlotStatus, not DataBlock
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+
+        let error = ccid::RdrDataBlock::parse(&bytes).expect_err("wrong type should fail");
+        assert!(matches!(error, CliError::Message(msg) if msg.contains("0x80")));
+    }
+
+    #[test]
+    fn ccid_rdr_data_block_rejects_truncated_header() {
+        let error = ccid::RdrDataBlock::parse(&[0x80, 0x00]).expect_err("short should fail");
+        assert!(matches!(error, CliError::Message(msg) if msg.contains("too short")));
+    }
+
+    // --- CCID signer input validation ---
+
+    #[test]
+    fn ccid_signer_rejects_wrong_digest_length() {
+        let config = token::CcidSignerConfig::new(
+            None,
+            "rutoken:slot=0;id=%01".to_string(),
+            None,
+            KeyAlgorithm::Gost3410_2012_256,
+            None,
+        );
+
+        let error = token::TokenSigner::sign_digest(
+            &config,
+            DigestAlgorithm::Gost3411_2012_256,
+            &[0u8; 16],
+        )
+        .expect_err("wrong digest length should fail");
+
+        assert!(matches!(error, CliError::Message(msg) if msg.contains("32 bytes")));
+    }
+
+    #[test]
+    fn ccid_signer_rejects_invalid_key_uri() {
+        let config = token::CcidSignerConfig::new(
+            None,
+            "pkcs11:id=%01".to_string(),
+            None,
+            KeyAlgorithm::Gost3410_2012_256,
+            None,
+        );
+
+        let error = token::TokenSigner::sign_digest(
+            &config,
+            DigestAlgorithm::Gost3411_2012_256,
+            &[0u8; 32],
+        )
+        .expect_err("pkcs11 URI on CCID signer should fail");
+
+        assert!(matches!(error, CliError::Usage(msg) if msg.contains("rutoken:")));
+    }
+
+    #[test]
+    fn ccid_probe_command_parses_exchange_log() {
+        let temp = TempDir::new();
+        let exchange_log = temp.path().join("probe.log");
+
+        let command = CcidProbeCommand::parse([
+            OsString::from("--ccid-reader"),
+            OsString::from("Rutoken ECP"),
+            OsString::from("--exchange-log"),
+            exchange_log.clone().into_os_string(),
+        ])
+        .expect("probe command should parse");
+
+        assert_eq!(command.ccid_reader.as_deref(), Some("Rutoken ECP"));
+        assert_eq!(
+            command.exchange_log.as_deref(),
+            Some(exchange_log.as_path())
+        );
+    }
+
+    #[test]
+    fn ccid_raw_sign_command_requires_pin_env() {
+        let temp = TempDir::new();
+        let input = temp.write_file("document.txt", "hello");
+        let output = temp.path().join("document.sig");
+
+        let error = CcidRawSignCommand::parse([
+            OsString::from("--input"),
+            input.into_os_string(),
+            OsString::from("--output"),
+            output.into_os_string(),
+            OsString::from("--key-uri"),
+            OsString::from("rutoken:slot=0;id=%01"),
+        ])
+        .expect_err("raw sign should require a PIN environment variable");
+
+        assert!(matches!(error, CliError::Usage(message) if message.contains("--pin-env")));
+    }
+
+    #[test]
+    fn ccid_log_redacts_verify_pin_apdu() {
+        let apdu = rutoken::verify_pin(b"12345678");
+
+        let (bytes, redacted) = ccid::redacted_apdu_bytes_for_log(&apdu).expect("APDU encodes");
+
+        assert!(redacted);
+        assert!(!bytes.windows(8).any(|window| window == b"12345678"));
+        assert_eq!(&bytes[5..13], b"********");
     }
 
     struct TempDir {
