@@ -624,6 +624,109 @@ pub mod ccid {
     }
 }
 
+#[cfg(feature = "pcsc")]
+pub mod pcsc_transport {
+    use super::{
+        CliError,
+        apdu::{CommandApdu, ResponseApdu},
+        ccid,
+    };
+    use pcsc::{Context, Protocols, Scope, ShareMode};
+    use std::path::Path;
+
+    pub struct PcscDevice {
+        _context: Context,
+        card: pcsc::Card,
+        logger: Option<ccid::ExchangeLogger>,
+        sequence: u8,
+    }
+
+    impl PcscDevice {
+        pub fn open_with_exchange_log(
+            reader_filter: Option<&str>,
+            exchange_log: Option<&Path>,
+        ) -> Result<Self, CliError> {
+            let context = Context::establish(Scope::User).map_err(|error| {
+                CliError::Message(format!("failed to establish PC/SC context: {error}"))
+            })?;
+            let readers = context.list_readers_owned().map_err(|error| {
+                CliError::Message(format!("failed to list PC/SC readers: {error}"))
+            })?;
+            let reader = readers
+                .iter()
+                .find(|reader| match (reader.to_str(), reader_filter) {
+                    (Ok(name), Some(filter)) => name.contains(filter),
+                    (Ok(_), None) => true,
+                    _ => false,
+                })
+                .ok_or_else(|| {
+                    let available = readers
+                        .iter()
+                        .filter_map(|reader| reader.to_str().ok())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    CliError::Message(format!(
+                        "no matching PC/SC reader found{}{}",
+                        reader_filter
+                            .map(|filter| format!(" for filter '{filter}'"))
+                            .unwrap_or_default(),
+                        if available.is_empty() {
+                            String::new()
+                        } else {
+                            format!("; available readers: {available}")
+                        }
+                    ))
+                })?;
+            let card = context
+                .connect(reader, ShareMode::Shared, Protocols::ANY)
+                .map_err(|error| {
+                    CliError::Message(format!("failed to connect to PC/SC reader: {error}"))
+                })?;
+            let mut logger = exchange_log.map(ccid::ExchangeLogger::create).transpose()?;
+            if let Some(logger) = logger.as_mut() {
+                logger.note(&format!("opened pcsc_reader={}", reader.to_string_lossy()))?;
+            }
+            Ok(Self {
+                _context: context,
+                card,
+                logger,
+                sequence: 0,
+            })
+        }
+
+        pub fn transmit(&mut self, apdu: &CommandApdu) -> Result<ResponseApdu, CliError> {
+            let seq = self.sequence;
+            self.sequence = self.sequence.wrapping_add(1);
+            let request = apdu.to_bytes()?;
+            let (apdu_log_bytes, redacted) = ccid::redacted_apdu_bytes_for_log(apdu)?;
+            if let Some(logger) = self.logger.as_mut() {
+                logger.bytes(
+                    "out",
+                    "pcsc-apdu",
+                    ccid::apdu_label(apdu),
+                    seq,
+                    &apdu_log_bytes,
+                    redacted,
+                )?;
+            }
+            let mut response = [0u8; 4096];
+            let response = self
+                .card
+                .transmit(&request, &mut response)
+                .map_err(|error| CliError::Message(format!("PC/SC transmit failed: {error}")))?;
+            if let Some(logger) = self.logger.as_mut() {
+                logger.bytes("in", "pcsc-apdu", "RESPONSE", seq, response, false)?;
+                logger.flush()?;
+            }
+            ResponseApdu::parse(response)
+        }
+
+        pub fn exchange_log_path(&self) -> Option<&Path> {
+            self.logger.as_ref().map(ccid::ExchangeLogger::path)
+        }
+    }
+}
+
 pub mod gost {
     use super::{CliError, DigestAlgorithm};
     use streebog::{Digest, Streebog256, Streebog512};
@@ -730,6 +833,21 @@ pub mod rutoken {
             .with_data([0x10, 0x00, 0x10, 0x00, 0x60, 0x02, 0x00, key_id])
     }
 
+    /// SELECT File: Rutoken ECP certificate EF under 3F00/1000/1000/6004.
+    pub fn select_certificate_file(key_id: u8) -> CommandApdu {
+        let file_id = certificate_file_id(key_id);
+        CommandApdu::new(0x00, 0xA4, 0x08, 0x0C).with_data([
+            0x10,
+            0x00,
+            0x10,
+            0x00,
+            0x60,
+            0x04,
+            (file_id >> 8) as u8,
+            file_id as u8,
+        ])
+    }
+
     pub fn private_key_file_select_sequences(key_id: u8) -> Vec<SelectSequence> {
         let pkcs15_private_key_id = 0x0100u16 | key_id as u16;
         vec![
@@ -771,11 +889,62 @@ pub mod rutoken {
         ]
     }
 
-    fn select_file_by_path(path: impl Into<Vec<u8>>) -> CommandApdu {
+    pub fn certificate_file_select_sequences(key_id: u8) -> Vec<SelectSequence> {
+        let certificate_id = certificate_file_id(key_id);
+        vec![
+            SelectSequence {
+                label: "Cer-DF relative path",
+                commands: vec![select_certificate_file(key_id)],
+            },
+            SelectSequence {
+                label: "Cer-DF absolute path",
+                commands: vec![select_file_by_path([
+                    0x3F,
+                    0x00,
+                    0x10,
+                    0x00,
+                    0x10,
+                    0x00,
+                    0x60,
+                    0x04,
+                    (certificate_id >> 8) as u8,
+                    certificate_id as u8,
+                ])],
+            },
+            SelectSequence {
+                label: "Cer-DF stepwise file IDs",
+                commands: vec![
+                    select_file_by_id(0x1000),
+                    select_file_by_id(0x1000),
+                    select_file_by_id(0x6004),
+                    select_file_by_id(certificate_id),
+                ],
+            },
+            SelectSequence {
+                label: "PKCS15-AppDF certificate path",
+                commands: vec![select_file_by_path([
+                    0x50,
+                    0x00,
+                    (certificate_id >> 8) as u8,
+                    certificate_id as u8,
+                ])],
+            },
+            SelectSequence {
+                label: "PKCS15-AppDF stepwise certificate file IDs",
+                commands: vec![select_file_by_id(0x5000), select_file_by_id(certificate_id)],
+            },
+        ]
+    }
+
+    fn certificate_file_id(key_id: u8) -> u16 {
+        0x0300u16 | key_id as u16
+    }
+
+    pub fn select_file_by_path(path: impl Into<Vec<u8>>) -> CommandApdu {
         CommandApdu::new(0x00, 0xA4, 0x08, 0x0C).with_data(path)
     }
 
-    fn select_file_by_id(file_id: u16) -> CommandApdu {
+    pub fn select_file_by_id(file_id: u16) -> CommandApdu {
         CommandApdu::new(0x00, 0xA4, 0x00, 0x0C).with_data([(file_id >> 8) as u8, file_id as u8])
     }
 
@@ -810,12 +979,14 @@ pub mod rutoken {
     /// order and requests a raw GOST R 34.10-2012 signature. `signature_len` is
     /// 64 for 256-bit keys and 128 for 512-bit keys.
     pub fn pso_compute_digital_signature(digest: &[u8], signature_len: u8) -> CommandApdu {
-        let mut token_digest = digest.to_vec();
-        token_digest.reverse();
-
         CommandApdu::new(0x00, 0x2A, 0x9E, 0x9A)
-            .with_data(token_digest)
+            .with_data(digest.to_vec())
             .with_le(signature_len)
+    }
+
+    /// READ BINARY from the currently selected transparent EF.
+    pub fn read_binary(offset: usize, le: u8) -> CommandApdu {
+        CommandApdu::new(0x00, 0xB0, (offset >> 8) as u8, offset as u8).with_le(le)
     }
 
     /// Convert the Rutoken ECP signature byte order back to the caller-facing order.
@@ -840,15 +1011,16 @@ pub fn compute_digest(data: &[u8], algorithm: DigestAlgorithm) -> Vec<u8> {
 pub mod cms_envelope {
     use super::{CliError, DigestAlgorithm, KeyAlgorithm};
     use cms::{
-        cert::{CertificateChoices, x509::Certificate},
+        cert::{CertificateChoices, IssuerAndSerialNumber, x509::Certificate},
         content_info::{CmsVersion, ContentInfo},
         signed_data::{
             CertificateSet, DigestAlgorithmIdentifiers, EncapsulatedContentInfo, SignatureValue,
-            SignedData, SignerIdentifier, SignerInfo, SignerInfos,
+            SignedAttributes, SignedData, SignerIdentifier, SignerInfo, SignerInfos,
         },
     };
     use der::{Any, AnyRef, Decode, Encode, asn1::OctetString};
     use spki::AlgorithmIdentifierOwned;
+    use x509_cert::attr::Attribute;
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct CmsSigningInput {
@@ -902,6 +1074,7 @@ pub mod cms_envelope {
         input: &CmsSigningInput,
         document: &[u8],
         signature: Vec<u8>,
+        signed_attrs: SignedAttributes,
     ) -> Result<Vec<u8>, CliError> {
         input.validate()?;
         if signature.is_empty() {
@@ -950,9 +1123,9 @@ pub mod cms_envelope {
             crls: None,
             signer_infos: SignerInfos::try_from(vec![SignerInfo {
                 version: CmsVersion::V1,
-                sid: SignerIdentifier::from(&certificate),
+                sid: signer_identifier(&certificate),
                 digest_alg: digest_algorithm,
-                signed_attrs: None,
+                signed_attrs: Some(signed_attrs),
                 signature_algorithm,
                 signature: SignatureValue::new(signature).map_err(|error| {
                     CliError::Message(format!("failed to encode signature value: {error}"))
@@ -974,6 +1147,40 @@ pub mod cms_envelope {
         })
     }
 
+    pub fn prepare_signed_attributes(
+        input: &CmsSigningInput,
+    ) -> Result<(SignedAttributes, Vec<u8>), CliError> {
+        input.validate()?;
+        let attributes = SignedAttributes::try_from(vec![
+            single_value_attribute(
+                const_oid::db::rfc5911::ID_CONTENT_TYPE,
+                &const_oid::db::rfc5911::ID_DATA.to_der().map_err(|error| {
+                    CliError::Message(format!("failed to encode contentType value: {error}"))
+                })?,
+            )?,
+            single_value_attribute(
+                const_oid::db::rfc5911::ID_MESSAGE_DIGEST,
+                &OctetString::new(input.content_digest.clone())
+                    .map_err(|error| {
+                        CliError::Message(format!(
+                            "failed to construct messageDigest value: {error}"
+                        ))
+                    })?
+                    .to_der()
+                    .map_err(|error| {
+                        CliError::Message(format!("failed to encode messageDigest value: {error}"))
+                    })?,
+            )?,
+        ])
+        .map_err(|error| {
+            CliError::Message(format!("failed to encode signed attributes: {error}"))
+        })?;
+        let der = attributes.to_der().map_err(|error| {
+            CliError::Message(format!("failed to serialize signed attributes: {error}"))
+        })?;
+        Ok((attributes, der))
+    }
+
     pub fn cms_crate_backend() -> &'static str {
         std::any::type_name::<cms::content_info::ContentInfo>()
     }
@@ -983,6 +1190,25 @@ pub mod cms_envelope {
             oid,
             parameters: None,
         }
+    }
+
+    fn signer_identifier(certificate: &Certificate) -> SignerIdentifier {
+        let tbs = certificate.tbs_certificate();
+        SignerIdentifier::IssuerAndSerialNumber(IssuerAndSerialNumber {
+            issuer: tbs.issuer().clone(),
+            serial_number: tbs.serial_number().clone(),
+        })
+    }
+
+    fn single_value_attribute(
+        oid: const_oid::ObjectIdentifier,
+        value_der: &[u8],
+    ) -> Result<Attribute, CliError> {
+        let mut values = der::asn1::SetOfVec::new();
+        values.insert(any_from_der(value_der)?).map_err(|error| {
+            CliError::Message(format!("failed to add signed attribute value: {error}"))
+        })?;
+        Ok(Attribute { oid, values })
     }
 
     fn any_from_der(der: &[u8]) -> Result<Any, CliError> {
@@ -1163,6 +1389,70 @@ pub mod token {
         }
     }
 
+    pub fn read_certificate_der(config: &CcidSignerConfig) -> Result<Vec<u8>, CliError> {
+        let uri = super::rutoken::RutokenUri::parse(&config.key_uri)?;
+        let pin: Option<Vec<u8>> = config.pin_env.as_deref().map(load_pin_bytes).transpose()?;
+        read_certificate_direct(config, uri.id, pin.as_deref())
+    }
+
+    enum ApduDevice {
+        Ccid(super::ccid::CcidDevice),
+        #[cfg(feature = "pcsc")]
+        Pcsc(super::pcsc_transport::PcscDevice),
+    }
+
+    impl ApduDevice {
+        fn open(config: &CcidSignerConfig) -> Result<Self, CliError> {
+            match super::ccid::CcidDevice::open_with_exchange_log(
+                config.reader.as_deref(),
+                config.exchange_log.as_deref(),
+            ) {
+                Ok(mut device) => match device.power_on() {
+                    Ok(_) => Ok(Self::Ccid(device)),
+                    Err(usb_error) => Self::open_after_ccid_error(config, usb_error),
+                },
+                Err(usb_error) => Self::open_after_ccid_error(config, usb_error),
+            }
+        }
+
+        #[cfg(feature = "pcsc")]
+        fn open_after_ccid_error(
+            config: &CcidSignerConfig,
+            usb_error: CliError,
+        ) -> Result<Self, CliError> {
+            match super::pcsc_transport::PcscDevice::open_with_exchange_log(
+                config.reader.as_deref(),
+                config.exchange_log.as_deref(),
+            ) {
+                Ok(device) => Ok(Self::Pcsc(device)),
+                Err(pcsc_error) => Err(CliError::Message(format!(
+                    "failed to open Rutoken via raw CCID ({usb_error}) or PC/SC ({pcsc_error})"
+                ))),
+            }
+        }
+
+        #[cfg(not(feature = "pcsc"))]
+        fn open_after_ccid_error(
+            _config: &CcidSignerConfig,
+            usb_error: CliError,
+        ) -> Result<Self, CliError> {
+            Err(CliError::Message(format!(
+                "failed to open Rutoken via raw CCID: {usb_error}"
+            )))
+        }
+
+        fn transmit(
+            &mut self,
+            apdu: &super::apdu::CommandApdu,
+        ) -> Result<super::apdu::ResponseApdu, CliError> {
+            match self {
+                Self::Ccid(device) => device.transmit(apdu),
+                #[cfg(feature = "pcsc")]
+                Self::Pcsc(device) => device.transmit(apdu),
+            }
+        }
+    }
+
     fn sign_digest_direct(
         config: &CcidSignerConfig,
         key_id: u8,
@@ -1170,12 +1460,7 @@ pub mod token {
         digest_algorithm: DigestAlgorithm,
         digest: &[u8],
     ) -> Result<Vec<u8>, CliError> {
-        let mut device = super::ccid::CcidDevice::open_with_exchange_log(
-            config.reader.as_deref(),
-            config.exchange_log.as_deref(),
-        )?;
-        device.power_on()?;
-
+        let mut device = ApduDevice::open(config)?;
         let resp = device.transmit(&super::rutoken::select_master_file())?;
         if !resp.is_success() {
             return Err(CliError::Message(format!(
@@ -1184,30 +1469,7 @@ pub mod token {
             )));
         }
 
-        if let Some(pin_bytes) = pin {
-            let mut resp = device.transmit(&super::rutoken::verify_pin(pin_bytes))?;
-            if resp.sw1 == 0x6F && resp.sw2 == 0x86 {
-                let logout = device.transmit(&super::rutoken::logout())?;
-                if !logout.is_success() {
-                    return Err(CliError::Message(format!(
-                        "LOGOUT failed after VERIFY returned 6f86: SW {:02x}{:02x}",
-                        logout.sw1, logout.sw2
-                    )));
-                }
-                resp = device.transmit(&super::rutoken::verify_pin(pin_bytes))?;
-            }
-            if !resp.is_success() {
-                let resp = if resp.sw1 == 0x63 && resp.sw2 == 0x00 {
-                    device.transmit(&super::rutoken::verify_pin_status())?
-                } else {
-                    resp
-                };
-                return Err(CliError::Message(format!(
-                    "VERIFY PIN failed: SW {:02x}{:02x}",
-                    resp.sw1, resp.sw2
-                )));
-            }
-        }
+        verify_pin_if_present(&mut device, pin)?;
 
         select_private_key_file(&mut device, key_id)?;
 
@@ -1253,10 +1515,59 @@ pub mod token {
         Ok(super::rutoken::signature_from_token(resp.data))
     }
 
-    fn select_private_key_file(
-        device: &mut super::ccid::CcidDevice,
+    fn read_certificate_direct(
+        config: &CcidSignerConfig,
         key_id: u8,
-    ) -> Result<(), CliError> {
+        pin: Option<&[u8]>,
+    ) -> Result<Vec<u8>, CliError> {
+        let mut device = ApduDevice::open(config)?;
+        let resp = device.transmit(&super::rutoken::select_master_file())?;
+        if !resp.is_success() {
+            return Err(CliError::Message(format!(
+                "SELECT MF failed: SW {:02x}{:02x}",
+                resp.sw1, resp.sw2
+            )));
+        }
+        verify_pin_if_present(&mut device, pin)?;
+        match select_certificate_file(&mut device, key_id) {
+            Ok(()) => match read_selected_certificate(&mut device) {
+                Ok(certificate) => Ok(certificate),
+                Err(read_error) => scan_certificate_files(&mut device, key_id, Some(read_error)),
+            },
+            Err(select_error) => scan_certificate_files(&mut device, key_id, Some(select_error)),
+        }
+    }
+
+    fn verify_pin_if_present(device: &mut ApduDevice, pin: Option<&[u8]>) -> Result<(), CliError> {
+        let Some(pin_bytes) = pin else {
+            return Ok(());
+        };
+        let mut resp = device.transmit(&super::rutoken::verify_pin(pin_bytes))?;
+        if resp.sw1 == 0x6F && resp.sw2 == 0x86 {
+            let logout = device.transmit(&super::rutoken::logout())?;
+            if !logout.is_success() {
+                return Err(CliError::Message(format!(
+                    "LOGOUT failed after VERIFY returned 6f86: SW {:02x}{:02x}",
+                    logout.sw1, logout.sw2
+                )));
+            }
+            resp = device.transmit(&super::rutoken::verify_pin(pin_bytes))?;
+        }
+        if !resp.is_success() {
+            let resp = if resp.sw1 == 0x63 && resp.sw2 == 0x00 {
+                device.transmit(&super::rutoken::verify_pin_status())?
+            } else {
+                resp
+            };
+            return Err(CliError::Message(format!(
+                "VERIFY PIN failed: SW {:02x}{:02x}",
+                resp.sw1, resp.sw2
+            )));
+        }
+        Ok(())
+    }
+
+    fn select_private_key_file(device: &mut ApduDevice, key_id: u8) -> Result<(), CliError> {
         let mut failures = Vec::new();
         for sequence in super::rutoken::private_key_file_select_sequences(key_id) {
             let reset = device.transmit(&super::rutoken::select_master_file())?;
@@ -1288,6 +1599,196 @@ pub mod token {
             "SELECT private key file (key reference 0x{key_id:02x}) failed: {}",
             failures.join(", ")
         )))
+    }
+
+    fn select_certificate_file(device: &mut ApduDevice, key_id: u8) -> Result<(), CliError> {
+        let mut failures = Vec::new();
+        for sequence in super::rutoken::certificate_file_select_sequences(key_id) {
+            let reset = device.transmit(&super::rutoken::select_master_file())?;
+            if !reset.is_success() {
+                return Err(CliError::Message(format!(
+                    "SELECT MF before certificate selection failed: SW {:02x}{:02x}",
+                    reset.sw1, reset.sw2
+                )));
+            }
+
+            let mut selected = true;
+            for apdu in sequence.commands {
+                let resp = device.transmit(&apdu)?;
+                if !resp.is_success() {
+                    failures.push(format!(
+                        "{} -> {:02x}{:02x}",
+                        sequence.label, resp.sw1, resp.sw2
+                    ));
+                    selected = false;
+                    break;
+                }
+            }
+            if selected {
+                return Ok(());
+            }
+        }
+
+        Err(CliError::Message(format!(
+            "SELECT certificate file (key reference 0x{key_id:02x}) failed: {}",
+            failures.join(", ")
+        )))
+    }
+
+    fn read_selected_certificate(device: &mut ApduDevice) -> Result<Vec<u8>, CliError> {
+        let mut data = Vec::new();
+        let mut offset = 0usize;
+        while offset < 16 * 1024 {
+            let resp = device.transmit(&super::rutoken::read_binary(offset, 0))?;
+            if resp.sw1 == 0x6B || resp.sw1 == 0x6A || resp.sw1 == 0x67 {
+                break;
+            }
+            if resp.sw1 == 0x62 && resp.sw2 == 0x82 {
+                data.extend_from_slice(&resp.data);
+                break;
+            }
+            if !resp.is_success() {
+                return Err(CliError::Message(format!(
+                    "READ BINARY certificate failed at offset {offset}: SW {:02x}{:02x}",
+                    resp.sw1, resp.sw2
+                )));
+            }
+            if resp.data.is_empty() {
+                break;
+            }
+            offset += resp.data.len();
+            data.extend_from_slice(&resp.data);
+            if resp.data.len() < 256 {
+                break;
+            }
+        }
+        extract_first_der_certificate(&data).ok_or_else(|| {
+            CliError::Message(format!(
+                "certificate file did not contain a DER certificate (read {} bytes)",
+                data.len()
+            ))
+        })
+    }
+
+    fn scan_certificate_files(
+        device: &mut ApduDevice,
+        key_id: u8,
+        previous_error: Option<CliError>,
+    ) -> Result<Vec<u8>, CliError> {
+        let directories: Vec<(&str, Vec<super::apdu::CommandApdu>)> = vec![
+            (
+                "Cer-DF",
+                vec![
+                    super::rutoken::select_file_by_id(0x1000),
+                    super::rutoken::select_file_by_id(0x1000),
+                    super::rutoken::select_file_by_id(0x6004),
+                ],
+            ),
+            (
+                "SysKey-DF",
+                vec![
+                    super::rutoken::select_file_by_id(0x1000),
+                    super::rutoken::select_file_by_id(0x1000),
+                ],
+            ),
+            (
+                "PKCS15-AppDF",
+                vec![super::rutoken::select_file_by_id(0x5000)],
+            ),
+            ("MF", Vec::new()),
+        ];
+        let candidates = certificate_candidate_file_ids(key_id);
+        let mut selected_files = Vec::new();
+
+        for (directory, commands) in directories {
+            for file_id in &candidates {
+                let reset = device.transmit(&super::rutoken::select_master_file())?;
+                if !reset.is_success() {
+                    continue;
+                }
+                let mut directory_selected = true;
+                for command in &commands {
+                    let resp = device.transmit(command)?;
+                    if !resp.is_success() {
+                        directory_selected = false;
+                        break;
+                    }
+                }
+                if !directory_selected {
+                    continue;
+                }
+                let select = device.transmit(&super::rutoken::select_file_by_id(*file_id))?;
+                if !select.is_success() {
+                    continue;
+                }
+                selected_files.push(format!("{directory}/{file_id:04x}"));
+                if let Ok(certificate) = read_selected_certificate(device) {
+                    return Ok(certificate);
+                }
+            }
+        }
+
+        let previous = previous_error
+            .map(|error| format!("; initial path error: {error}"))
+            .unwrap_or_default();
+        Err(CliError::Message(format!(
+            "no DER certificate found in Rutoken certificate scan for key reference 0x{key_id:02x}; selected files tried: {}{}",
+            if selected_files.is_empty() {
+                "none".to_string()
+            } else {
+                selected_files.join(", ")
+            },
+            previous
+        )))
+    }
+
+    fn certificate_candidate_file_ids(key_id: u8) -> Vec<u16> {
+        let mut ids = Vec::new();
+        for base in [
+            0x0000u16, 0x0100, 0x0200, 0x0300, 0x0400, 0x0500, 0x0600, 0x4000, 0x5000,
+        ] {
+            ids.push(base | key_id as u16);
+            for suffix in 1u16..=0x20 {
+                ids.push(base | suffix);
+            }
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+
+    fn extract_first_der_certificate(data: &[u8]) -> Option<Vec<u8>> {
+        for start in 0..data.len() {
+            if data[start] != 0x30 {
+                continue;
+            }
+            let Some(total_len) = der_sequence_total_len(&data[start..]) else {
+                continue;
+            };
+            if start + total_len <= data.len() {
+                return Some(data[start..start + total_len].to_vec());
+            }
+        }
+        None
+    }
+
+    fn der_sequence_total_len(data: &[u8]) -> Option<usize> {
+        if data.len() < 2 || data[0] != 0x30 {
+            return None;
+        }
+        let len_byte = data[1];
+        if len_byte & 0x80 == 0 {
+            return Some(2 + len_byte as usize);
+        }
+        let len_len = (len_byte & 0x7f) as usize;
+        if len_len == 0 || len_len > 4 || data.len() < 2 + len_len {
+            return None;
+        }
+        let mut len = 0usize;
+        for byte in &data[2..2 + len_len] {
+            len = (len << 8) | *byte as usize;
+        }
+        Some(2 + len_len + len)
     }
 
     pub fn ensure_module_path(path: &Path) -> Result<(), CliError> {
@@ -1546,6 +2047,445 @@ pub mod token {
     }
 }
 
+pub mod gosuslugi_bridge {
+    use super::{
+        CliError, DigestAlgorithm, KeyAlgorithm, cms_envelope, compute_digest, hex_encode, token,
+    };
+    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+    use cms::cert::x509::{Certificate, ext::pkix::name::DirectoryString, name::Name};
+    use der::{Decode, Encode, Tag, Tagged, asn1::Ia5StringRef};
+    use serde::{Deserialize, Serialize};
+    use std::{
+        io::{Read, Write},
+        net::{TcpListener, TcpStream, ToSocketAddrs},
+        sync::Arc,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    #[derive(Debug, Clone)]
+    pub struct BridgeConfig {
+        pub bind: String,
+        pub certificate: CertificateRecord,
+        pub certificate_der: Option<Vec<u8>>,
+        pub signer: token::CcidSignerConfig,
+        pub digest_algorithm: DigestAlgorithm,
+        pub key_algorithm: KeyAlgorithm,
+    }
+
+    #[derive(Debug, Clone, Deserialize, Serialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct CertificateRecord {
+        pub raw: String,
+        pub serial_number: String,
+        pub subject: String,
+        pub issuer: String,
+        pub not_before: u64,
+        pub not_after: u64,
+        pub signature_algorithm: String,
+        pub container: String,
+        pub version: String,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(untagged)]
+    enum SignatureRequest {
+        Envelope(SignatureEnvelope),
+        File(BridgeFile),
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct SignatureEnvelope {
+        files: Vec<BridgeFile>,
+        #[allow(dead_code)]
+        certificate: Option<BridgeFile>,
+        #[allow(dead_code)]
+        #[serde(default)]
+        r#type: String,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct BridgeFile {
+        #[serde(default)]
+        content: String,
+        #[serde(default)]
+        content_encoding: String,
+        #[allow(dead_code)]
+        #[serde(default)]
+        name: String,
+    }
+
+    #[derive(Debug, Serialize)]
+    struct CertificatesResponse<'a> {
+        certificates: &'a [CertificateRecord],
+    }
+
+    #[derive(Debug, Serialize)]
+    struct SignatureResponse {
+        contents: Vec<String>,
+    }
+
+    pub fn certificate_record_from_der(
+        der: &[u8],
+        container: impl Into<String>,
+    ) -> Result<CertificateRecord, CliError> {
+        let certificate = Certificate::from_der(der)
+            .map_err(|error| CliError::Message(format!("failed to parse --cert DER: {error}")))?;
+        let tbs = certificate.tbs_certificate();
+        let validity = tbs.validity();
+        Ok(CertificateRecord {
+            raw: BASE64.encode(der),
+            serial_number: hex_encode(tbs.serial_number().as_bytes()).to_uppercase(),
+            subject: name_to_gosuslugi_dn(tbs.subject()),
+            issuer: name_to_gosuslugi_dn(tbs.issuer()),
+            not_before: validity.not_before.to_unix_duration().as_secs(),
+            not_after: validity.not_after.to_unix_duration().as_secs(),
+            signature_algorithm: certificate.signature_algorithm().oid.to_string(),
+            container: container.into(),
+            version: format!("{:?}", tbs.version()),
+        })
+    }
+
+    pub fn certificate_der_from_record_raw(
+        record: &CertificateRecord,
+    ) -> Result<Option<Vec<u8>>, CliError> {
+        if record.raw.trim().is_empty() {
+            return Ok(None);
+        }
+        let der = BASE64.decode(record.raw.as_bytes()).map_err(|error| {
+            CliError::Message(format!("invalid certificate record raw base64: {error}"))
+        })?;
+        Certificate::from_der(&der).map_err(|error| {
+            CliError::Message(format!(
+                "certificate record raw is not a DER certificate: {error}"
+            ))
+        })?;
+        Ok(Some(der))
+    }
+
+    pub fn serve(config: BridgeConfig) -> Result<(), CliError> {
+        let addr = config
+            .bind
+            .to_socket_addrs()
+            .map_err(|error| CliError::Message(format!("invalid --bind address: {error}")))?
+            .next()
+            .ok_or_else(|| {
+                CliError::Message(format!("--bind resolved no addresses: {}", config.bind))
+            })?;
+        let listener = TcpListener::bind(addr).map_err(|error| {
+            CliError::Message(format!("failed to bind {}: {error}", config.bind))
+        })?;
+        let config = Arc::new(config);
+        eprintln!(
+            "gosuslugi bridge listening on http://{}",
+            listener
+                .local_addr()
+                .map_err(|error| CliError::Message(format!(
+                    "failed to read listener address: {error}"
+                )))?
+        );
+        eprintln!(
+            "inject browser/gosuslugi-inject.js into the Gosuslugi tab, then reload the page if certificate search already failed"
+        );
+
+        for stream in listener.incoming() {
+            match stream {
+                Ok(stream) => {
+                    let config = Arc::clone(&config);
+                    if let Err(error) = handle_connection(stream, &config) {
+                        eprintln!("gosuslugi bridge request failed: {error}");
+                    }
+                }
+                Err(error) => eprintln!("gosuslugi bridge accept failed: {error}"),
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_connection(mut stream: TcpStream, config: &BridgeConfig) -> Result<(), CliError> {
+        let request = HttpRequest::read_from(&mut stream)?;
+        let response = match (request.method.as_str(), request.path.as_str()) {
+            ("OPTIONS", _) => HttpResponse::empty(204),
+            ("GET", "/health") => HttpResponse::json(
+                200,
+                &serde_json::json!({
+                    "ok": true,
+                    "time": unix_now(),
+                }),
+            )?,
+            ("POST", "/certificates") => HttpResponse::json(
+                200,
+                &CertificatesResponse {
+                    certificates: std::slice::from_ref(&config.certificate),
+                },
+            )?,
+            ("POST", "/signature") => {
+                let request: SignatureRequest =
+                    serde_json::from_slice(&request.body).map_err(|error| {
+                        CliError::Message(format!("invalid signature JSON: {error}"))
+                    })?;
+                let signatures = sign_files(config, request)?;
+                HttpResponse::json(
+                    200,
+                    &SignatureResponse {
+                        contents: signatures,
+                    },
+                )?
+            }
+            _ => HttpResponse::text(404, "not found"),
+        };
+        response.write_to(&mut stream)
+    }
+
+    fn sign_files(
+        config: &BridgeConfig,
+        request: SignatureRequest,
+    ) -> Result<Vec<String>, CliError> {
+        let (files, detached) = match request {
+            SignatureRequest::Envelope(envelope) => {
+                if envelope.files.is_empty() {
+                    return Err(CliError::Message(
+                        "signature request did not include files".to_string(),
+                    ));
+                }
+                (
+                    envelope.files,
+                    envelope.r#type.eq_ignore_ascii_case("detached"),
+                )
+            }
+            SignatureRequest::File(file) => (vec![file], false),
+        };
+        files
+            .into_iter()
+            .map(|file| sign_file(config, file, detached))
+            .collect()
+    }
+
+    fn sign_file(
+        config: &BridgeConfig,
+        file: BridgeFile,
+        detached: bool,
+    ) -> Result<String, CliError> {
+        if file.content.trim().is_empty() {
+            return Err(CliError::Message(
+                "signature request file did not include content".to_string(),
+            ));
+        }
+        if !file.content_encoding.is_empty() && file.content_encoding != "base64" {
+            return Err(CliError::Message(format!(
+                "unsupported file contentEncoding: {}",
+                file.content_encoding
+            )));
+        }
+        let document = BASE64
+            .decode(file.content.as_bytes())
+            .map_err(|error| CliError::Message(format!("invalid base64 file content: {error}")))?;
+        let digest = compute_digest(&document, config.digest_algorithm);
+        let Some(certificate_der) = config.certificate_der.clone() else {
+            return Err(CliError::Message(
+                "signature request requires signer certificate DER; provide --cert or a certificate record with base64 DER in raw".to_string(),
+            ));
+        };
+        let cms_input = cms_envelope::CmsSigningInput::new(
+            digest,
+            config.digest_algorithm,
+            config.key_algorithm,
+            certificate_der,
+            detached,
+        );
+        let (signed_attrs, signed_attrs_der) = cms_envelope::prepare_signed_attributes(&cms_input)?;
+        let signed_attrs_digest = compute_digest(&signed_attrs_der, config.digest_algorithm);
+        let signature = token::TokenSigner::sign_digest(
+            &config.signer,
+            config.digest_algorithm,
+            &signed_attrs_digest,
+        )?;
+        let cms_der =
+            cms_envelope::build_signed_data_der(&cms_input, &document, signature, signed_attrs)?;
+        Ok(BASE64.encode(cms_der))
+    }
+
+    fn name_to_gosuslugi_dn(name: &Name) -> String {
+        name.iter()
+            .map(|attribute| {
+                format!(
+                    "{}={}",
+                    attribute.oid,
+                    any_to_string(&attribute.value).replace(';', ",")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(";")
+    }
+
+    fn any_to_string(any: &der::asn1::Any) -> String {
+        if let Ok(value) = DirectoryString::try_from(any) {
+            return value.value().into_owned();
+        }
+        if matches!(
+            any.tag(),
+            Tag::NumericString
+                | Tag::PrintableString
+                | Tag::TeletexString
+                | Tag::VideotexString
+                | Tag::VisibleString
+                | Tag::GeneralString
+        ) && let Ok(value) = std::str::from_utf8(any.value())
+        {
+            return value.to_string();
+        }
+        if let Ok(value) = Ia5StringRef::try_from(any) {
+            return value.as_str().to_string();
+        }
+        any.to_der()
+            .map(|der| hex_encode(&der))
+            .unwrap_or_else(|_| String::new())
+    }
+
+    fn unix_now() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or_default()
+    }
+
+    #[derive(Debug)]
+    struct HttpRequest {
+        method: String,
+        path: String,
+        body: Vec<u8>,
+    }
+
+    impl HttpRequest {
+        fn read_from(stream: &mut TcpStream) -> Result<Self, CliError> {
+            let mut buffer = Vec::new();
+            let mut temp = [0u8; 4096];
+            loop {
+                let read = stream.read(&mut temp).map_err(|error| {
+                    CliError::Message(format!("failed to read HTTP request: {error}"))
+                })?;
+                if read == 0 {
+                    break;
+                }
+                buffer.extend_from_slice(&temp[..read]);
+                if header_end(&buffer).is_some() {
+                    break;
+                }
+                if buffer.len() > 64 * 1024 {
+                    return Err(CliError::Message(
+                        "HTTP request headers are too large".to_string(),
+                    ));
+                }
+            }
+            let Some(header_end) = header_end(&buffer) else {
+                return Err(CliError::Message(
+                    "HTTP request missing header terminator".to_string(),
+                ));
+            };
+            let headers = String::from_utf8_lossy(&buffer[..header_end]);
+            let mut lines = headers.lines();
+            let request_line = lines
+                .next()
+                .ok_or_else(|| CliError::Message("HTTP request line is missing".to_string()))?;
+            let mut request_parts = request_line.split_whitespace();
+            let method = request_parts
+                .next()
+                .ok_or_else(|| CliError::Message("HTTP method is missing".to_string()))?
+                .to_string();
+            let path = request_parts
+                .next()
+                .ok_or_else(|| CliError::Message("HTTP path is missing".to_string()))?
+                .split('?')
+                .next()
+                .unwrap_or("/")
+                .to_string();
+            let content_length = lines
+                .filter_map(|line| line.split_once(':'))
+                .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+
+            let body_start = header_end + 4;
+            while buffer.len() < body_start + content_length {
+                let read = stream.read(&mut temp).map_err(|error| {
+                    CliError::Message(format!("failed to read HTTP body: {error}"))
+                })?;
+                if read == 0 {
+                    break;
+                }
+                buffer.extend_from_slice(&temp[..read]);
+            }
+            let body_end = (body_start + content_length).min(buffer.len());
+            Ok(Self {
+                method,
+                path,
+                body: buffer[body_start..body_end].to_vec(),
+            })
+        }
+    }
+
+    struct HttpResponse {
+        status: u16,
+        content_type: &'static str,
+        body: Vec<u8>,
+    }
+
+    impl HttpResponse {
+        fn empty(status: u16) -> Self {
+            Self {
+                status,
+                content_type: "text/plain; charset=utf-8",
+                body: Vec::new(),
+            }
+        }
+
+        fn text(status: u16, body: impl Into<String>) -> Self {
+            Self {
+                status,
+                content_type: "text/plain; charset=utf-8",
+                body: body.into().into_bytes(),
+            }
+        }
+
+        fn json(status: u16, value: &impl Serialize) -> Result<Self, CliError> {
+            Ok(Self {
+                status,
+                content_type: "application/json; charset=utf-8",
+                body: serde_json::to_vec(value).map_err(|error| {
+                    CliError::Message(format!("failed to encode JSON: {error}"))
+                })?,
+            })
+        }
+
+        fn write_to(&self, stream: &mut TcpStream) -> Result<(), CliError> {
+            let reason = match self.status {
+                200 => "OK",
+                204 => "No Content",
+                404 => "Not Found",
+                500 => "Internal Server Error",
+                _ => "OK",
+            };
+            let header = format!(
+                "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: content-type\r\nAccess-Control-Allow-Private-Network: true\r\nConnection: close\r\n\r\n",
+                self.status,
+                reason,
+                self.content_type,
+                self.body.len()
+            );
+            stream
+                .write_all(header.as_bytes())
+                .and_then(|_| stream.write_all(&self.body))
+                .map_err(|error| {
+                    CliError::Message(format!("failed to write HTTP response: {error}"))
+                })
+        }
+    }
+
+    fn header_end(buffer: &[u8]) -> Option<usize> {
+        buffer.windows(4).position(|window| window == b"\r\n\r\n")
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DigestAlgorithm {
     Gost3411_2012_256,
@@ -1563,10 +2503,10 @@ pub enum KeyAlgorithm {
     Rsa,
 }
 
-const OID_GOST3410_2012_256: const_oid::ObjectIdentifier =
-    const_oid::ObjectIdentifier::new_unwrap("1.2.643.7.1.1.1.1");
-const OID_GOST3410_2012_512: const_oid::ObjectIdentifier =
-    const_oid::ObjectIdentifier::new_unwrap("1.2.643.7.1.1.1.2");
+const OID_GOST3410_2012_256_WITH_GOST3411_2012_256: const_oid::ObjectIdentifier =
+    const_oid::ObjectIdentifier::new_unwrap("1.2.643.7.1.1.3.2");
+const OID_GOST3410_2012_512_WITH_GOST3411_2012_512: const_oid::ObjectIdentifier =
+    const_oid::ObjectIdentifier::new_unwrap("1.2.643.7.1.1.3.3");
 const OID_GOST3411_2012_256: const_oid::ObjectIdentifier =
     const_oid::ObjectIdentifier::new_unwrap("1.2.643.7.1.1.2.2");
 const OID_GOST3411_2012_512: const_oid::ObjectIdentifier =
@@ -1700,10 +2640,10 @@ impl KeyAlgorithm {
     ) -> Result<const_oid::ObjectIdentifier, CliError> {
         match (self, digest) {
             (Self::Gost3410_2012_256, DigestAlgorithm::Gost3411_2012_256) => {
-                Ok(OID_GOST3410_2012_256)
+                Ok(OID_GOST3410_2012_256_WITH_GOST3411_2012_256)
             }
             (Self::Gost3410_2012_512, DigestAlgorithm::Gost3411_2012_512) => {
-                Ok(OID_GOST3410_2012_512)
+                Ok(OID_GOST3410_2012_512_WITH_GOST3411_2012_512)
             }
             (Self::Ecdsa, DigestAlgorithm::Sha256) => Ok(OID_ECDSA_WITH_SHA256),
             (Self::Ecdsa, DigestAlgorithm::Sha384) => Ok(OID_ECDSA_WITH_SHA384),
@@ -1785,6 +2725,28 @@ pub struct CcidRawSignCommand {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CcidReadCertCommand {
+    pub output: PathBuf,
+    pub key_uri: String,
+    pub pin_env: Option<String>,
+    pub ccid_reader: Option<String>,
+    pub exchange_log: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GosuslugiBridgeCommand {
+    pub bind: String,
+    pub cert: Option<PathBuf>,
+    pub cert_record: Option<PathBuf>,
+    pub key_uri: String,
+    pub digest: DigestAlgorithm,
+    pub key_algorithm: KeyAlgorithm,
+    pub pin_env: String,
+    pub ccid_reader: Option<String>,
+    pub exchange_log: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CliError {
     Message(String),
     Usage(String),
@@ -1826,11 +2788,270 @@ where
             let command = CcidRawSignCommand::parse(args)?;
             command.run()
         }
+        Some(command) if command == "ccid-read-cert" => {
+            let command = CcidReadCertCommand::parse(args)?;
+            command.run()
+        }
+        Some(command) if command == "gosuslugi-bridge" => {
+            let command = GosuslugiBridgeCommand::parse(args)?;
+            command.run()
+        }
         Some(command) => Err(CliError::Usage(format!(
             "unknown command: {}\n\n{}",
             command.to_string_lossy(),
             usage()
         ))),
+    }
+}
+
+impl GosuslugiBridgeCommand {
+    fn parse<I>(args: I) -> Result<Self, CliError>
+    where
+        I: IntoIterator<Item = OsString>,
+    {
+        let mut bind = String::from("127.0.0.1:18765");
+        let mut cert = None;
+        let mut cert_record = None;
+        let mut key_uri = None;
+        let mut digest = DigestAlgorithm::Gost3411_2012_256;
+        let mut key_algorithm_override: Option<KeyAlgorithm> = None;
+        let mut pin_env = None;
+        let mut ccid_reader = None;
+        let mut exchange_log = None;
+
+        let mut iter = args.into_iter();
+        while let Some(arg) = iter.next() {
+            match arg.to_string_lossy().as_ref() {
+                "--bind" => bind = next_value(&mut iter, "--bind")?.to_string_lossy().into(),
+                "--cert" => cert = Some(PathBuf::from(next_value(&mut iter, "--cert")?)),
+                "--cert-record" => {
+                    cert_record = Some(PathBuf::from(next_value(&mut iter, "--cert-record")?))
+                }
+                "--key-uri" => {
+                    key_uri = Some(next_value(&mut iter, "--key-uri")?.to_string_lossy().into())
+                }
+                "--digest" => {
+                    digest = DigestAlgorithm::parse(
+                        next_value(&mut iter, "--digest")?
+                            .to_string_lossy()
+                            .as_ref(),
+                    )?
+                }
+                "--key-algorithm" => {
+                    key_algorithm_override = Some(KeyAlgorithm::parse(
+                        next_value(&mut iter, "--key-algorithm")?
+                            .to_string_lossy()
+                            .as_ref(),
+                    )?)
+                }
+                "--pin-env" => {
+                    pin_env = Some(
+                        next_value(&mut iter, "--pin-env")?
+                            .to_string_lossy()
+                            .into_owned(),
+                    )
+                }
+                "--ccid-reader" => {
+                    ccid_reader = Some(
+                        next_value(&mut iter, "--ccid-reader")?
+                            .to_string_lossy()
+                            .into(),
+                    )
+                }
+                "--exchange-log" => {
+                    exchange_log = Some(PathBuf::from(next_value(&mut iter, "--exchange-log")?))
+                }
+                "--help" | "-h" => return Err(CliError::Usage(usage())),
+                flag => {
+                    return Err(CliError::Usage(format!(
+                        "unknown option: {flag}\n\n{}",
+                        usage()
+                    )));
+                }
+            }
+        }
+
+        let key_algorithm =
+            key_algorithm_override.unwrap_or_else(|| KeyAlgorithm::default_for_digest(digest));
+        let command = Self {
+            bind,
+            cert,
+            cert_record,
+            key_uri: required_string(key_uri, "--key-uri")?,
+            digest,
+            key_algorithm,
+            pin_env: required_string(pin_env, "--pin-env")?,
+            ccid_reader,
+            exchange_log,
+        };
+        command.validate()?;
+        Ok(command)
+    }
+
+    fn validate(&self) -> Result<(), CliError> {
+        if let Some(cert) = &self.cert {
+            ensure_file_exists(cert, "--cert")?;
+        }
+        if let Some(cert_record) = &self.cert_record {
+            ensure_file_exists(cert_record, "--cert-record")?;
+        }
+        if self.cert.is_some() && self.cert_record.is_some() {
+            return Err(CliError::Usage(
+                String::from("use either --cert or --cert-record, not both\n\n") + &usage(),
+            ));
+        }
+        rutoken::RutokenUri::parse(&self.key_uri)?;
+        match (self.digest, self.key_algorithm) {
+            (DigestAlgorithm::Gost3411_2012_256, KeyAlgorithm::Gost3410_2012_256)
+            | (DigestAlgorithm::Gost3411_2012_512, KeyAlgorithm::Gost3410_2012_512) => Ok(()),
+            _ => Err(CliError::Usage(
+                String::from(
+                    "gosuslugi-bridge currently supports only Rutoken GOST signing; use --digest \
+                     gost12-256/512 with the matching --key-algorithm \
+                     gost3410-2012-256/512\n\n",
+                ) + &usage(),
+            )),
+        }
+    }
+
+    pub fn run(&self) -> Result<String, CliError> {
+        let signer = token::CcidSignerConfig::new(
+            self.ccid_reader.clone(),
+            self.key_uri.clone(),
+            Some(self.pin_env.clone()),
+            self.key_algorithm,
+            self.exchange_log.clone(),
+        );
+        let (certificate, certificate_der) = if let Some(cert) = &self.cert {
+            let certificate_der = fs::read(cert).map_err(|error| {
+                CliError::Message(format!("failed to read --cert {}: {error}", cert.display()))
+            })?;
+            let certificate = gosuslugi_bridge::certificate_record_from_der(
+                &certificate_der,
+                self.key_uri.clone(),
+            )?;
+            (certificate, Some(certificate_der))
+        } else if let Some(cert_record) = &self.cert_record {
+            let record_json = fs::read(cert_record).map_err(|error| {
+                CliError::Message(format!(
+                    "failed to read --cert-record {}: {error}",
+                    cert_record.display()
+                ))
+            })?;
+            let certificate: gosuslugi_bridge::CertificateRecord =
+                serde_json::from_slice(&record_json).map_err(|error| {
+                    CliError::Message(format!(
+                        "failed to parse --cert-record {}: {error}",
+                        cert_record.display()
+                    ))
+                })?;
+            let certificate_der = gosuslugi_bridge::certificate_der_from_record_raw(&certificate)?;
+            (certificate, certificate_der)
+        } else {
+            let certificate_der = token::read_certificate_der(&signer)?;
+            let certificate = gosuslugi_bridge::certificate_record_from_der(
+                &certificate_der,
+                self.key_uri.clone(),
+            )?;
+            (certificate, Some(certificate_der))
+        };
+        gosuslugi_bridge::serve(gosuslugi_bridge::BridgeConfig {
+            bind: self.bind.clone(),
+            certificate,
+            certificate_der,
+            signer,
+            digest_algorithm: self.digest,
+            key_algorithm: self.key_algorithm,
+        })?;
+        Ok(String::new())
+    }
+}
+
+impl CcidReadCertCommand {
+    fn parse<I>(args: I) -> Result<Self, CliError>
+    where
+        I: IntoIterator<Item = OsString>,
+    {
+        let mut output = None;
+        let mut key_uri = None;
+        let mut pin_env = None;
+        let mut ccid_reader = None;
+        let mut exchange_log = None;
+
+        let mut iter = args.into_iter();
+        while let Some(arg) = iter.next() {
+            match arg.to_string_lossy().as_ref() {
+                "--output" => output = Some(PathBuf::from(next_value(&mut iter, "--output")?)),
+                "--key-uri" => {
+                    key_uri = Some(next_value(&mut iter, "--key-uri")?.to_string_lossy().into())
+                }
+                "--pin-env" => {
+                    pin_env = Some(
+                        next_value(&mut iter, "--pin-env")?
+                            .to_string_lossy()
+                            .into_owned(),
+                    )
+                }
+                "--ccid-reader" => {
+                    ccid_reader = Some(
+                        next_value(&mut iter, "--ccid-reader")?
+                            .to_string_lossy()
+                            .into(),
+                    )
+                }
+                "--exchange-log" => {
+                    exchange_log = Some(PathBuf::from(next_value(&mut iter, "--exchange-log")?))
+                }
+                "--help" | "-h" => return Err(CliError::Usage(usage())),
+                flag => {
+                    return Err(CliError::Usage(format!(
+                        "unknown option: {flag}\n\n{}",
+                        usage()
+                    )));
+                }
+            }
+        }
+
+        let command = Self {
+            output: required_path(output, "--output")?,
+            key_uri: required_string(key_uri, "--key-uri")?,
+            pin_env,
+            ccid_reader,
+            exchange_log,
+        };
+        command.validate()?;
+        Ok(command)
+    }
+
+    fn validate(&self) -> Result<(), CliError> {
+        ensure_parent_exists(&self.output, "--output")?;
+        rutoken::RutokenUri::parse(&self.key_uri)?;
+        Ok(())
+    }
+
+    pub fn run(&self) -> Result<String, CliError> {
+        let signer = token::CcidSignerConfig::new(
+            self.ccid_reader.clone(),
+            self.key_uri.clone(),
+            self.pin_env.clone(),
+            KeyAlgorithm::Gost3410_2012_256,
+            self.exchange_log.clone(),
+        );
+        let certificate_der = token::read_certificate_der(&signer)?;
+        let certificate =
+            gosuslugi_bridge::certificate_record_from_der(&certificate_der, self.key_uri.clone())?;
+        fs::write(&self.output, certificate_der).map_err(|error| {
+            CliError::Message(format!(
+                "failed to write --output {}: {error}",
+                self.output.display()
+            ))
+        })?;
+        Ok(format!(
+            "wrote Rutoken certificate to {}\nserial_number={}\nsubject={}",
+            self.output.display(),
+            certificate.serial_number,
+            certificate.subject
+        ))
     }
 }
 
@@ -2009,6 +3230,8 @@ impl SignCommand {
             !self.embed_content,
         );
         cms_input.validate()?;
+        let (signed_attrs, signed_attrs_der) = cms_envelope::prepare_signed_attributes(&cms_input)?;
+        let signed_attrs_digest = compute_digest(&signed_attrs_der, self.digest);
 
         if self.dry_run {
             return Ok(self.render_plan(&digest));
@@ -2022,7 +3245,7 @@ impl SignCommand {
                     self.pin_env.clone(),
                     self.key_algorithm,
                 );
-                token::TokenSigner::sign_digest(&signer, self.digest, &digest)
+                token::TokenSigner::sign_digest(&signer, self.digest, &signed_attrs_digest)
             }
             Transport::Ccid => {
                 let signer = token::CcidSignerConfig::new(
@@ -2032,10 +3255,11 @@ impl SignCommand {
                     self.key_algorithm,
                     self.exchange_log.clone(),
                 );
-                token::TokenSigner::sign_digest(&signer, self.digest, &digest)
+                token::TokenSigner::sign_digest(&signer, self.digest, &signed_attrs_digest)
             }
         }?;
-        let cms_der = cms_envelope::build_signed_data_der(&cms_input, &document, signature)?;
+        let cms_der =
+            cms_envelope::build_signed_data_der(&cms_input, &document, signature, signed_attrs)?;
         fs::write(&self.output, cms_der).map_err(|error| {
             CliError::Message(format!(
                 "failed to write --output {}: {error}",
@@ -2389,6 +3613,8 @@ fn usage() -> String {
                      sign                    Build a CMS signature using PKCS#11 or direct CCID\n\
                      ccid-probe              Open the Rutoken CCID interface and log ATR/SELECT MF\n\
                      ccid-sign-raw           Sign a document digest over direct CCID and write raw bytes\n\
+                     ccid-read-cert          Read the Rutoken signer certificate to DER\n\
+                     gosuslugi-bridge        Serve a localhost Gosuslugi plugin shim for Safari injection\n\
          \n\
          Options:\n\
            --digest <NAME>           Hash algorithm: gost12-256 (default), gost12-512,\n\
@@ -2398,6 +3624,7 @@ fn usage() -> String {
                                      (default for SHA-2 digests), or rsa\n\
            --transport <NAME>        pkcs11 (default) or ccid\n\
            --pkcs11-module <FILE>    PKCS#11 module used by the cryptoki Rust crate\n\
+           --cert-record <FILE>      Gosuslugi certificate metadata JSON for bridge listing\n\
            --pin-env <NAME>          Read the user PIN from an environment variable\n\
            --ccid-reader <NAME>      CCID reader selector for direct USB/APDU work\n\
            --exchange-log <FILE>     Write a redacted direct CCID/APDU exchange log\n\
@@ -2419,8 +3646,9 @@ fn usage() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        CcidProbeCommand, CcidRawSignCommand, CliError, DigestAlgorithm, KeyAlgorithm, SignCommand,
-        Transport, apdu, ccid, cms_envelope, compute_digest, gost, run_cli, rutoken, token,
+        CcidProbeCommand, CcidRawSignCommand, CcidReadCertCommand, CliError, DigestAlgorithm,
+        GosuslugiBridgeCommand, KeyAlgorithm, SignCommand, Transport, apdu, ccid, cms_envelope,
+        compute_digest, gost, run_cli, rutoken, token,
     };
     use std::{
         env,
@@ -2487,6 +3715,106 @@ mod tests {
         ])
         .expect("command should parse");
 
+        assert_eq!(
+            command.exchange_log.as_deref(),
+            Some(exchange_log.as_path())
+        );
+    }
+
+    #[test]
+    fn parses_gosuslugi_bridge_command() {
+        let temp = TempDir::new();
+        let cert = temp.write_file("signer.der", "certificate");
+        let exchange_log = temp.path().join("gosuslugi.log");
+
+        let command = GosuslugiBridgeCommand::parse([
+            OsString::from("--bind"),
+            OsString::from("127.0.0.1:18766"),
+            OsString::from("--cert"),
+            cert.clone().into_os_string(),
+            OsString::from("--key-uri"),
+            OsString::from("rutoken:slot=0;id=%03"),
+            OsString::from("--ccid-reader"),
+            OsString::from("Rutoken ECP"),
+            OsString::from("--exchange-log"),
+            exchange_log.clone().into_os_string(),
+            OsString::from("--pin-env"),
+            OsString::from("TOKEN_PIN"),
+        ])
+        .expect("command should parse");
+
+        assert_eq!(command.bind, "127.0.0.1:18766");
+        assert_eq!(command.cert.as_deref(), Some(cert.as_path()));
+        assert_eq!(command.cert_record, None);
+        assert_eq!(command.key_uri, "rutoken:slot=0;id=%03");
+        assert_eq!(command.pin_env, "TOKEN_PIN");
+        assert_eq!(command.ccid_reader.as_deref(), Some("Rutoken ECP"));
+        assert_eq!(
+            command.exchange_log.as_deref(),
+            Some(exchange_log.as_path())
+        );
+        assert_eq!(command.digest, DigestAlgorithm::Gost3411_2012_256);
+        assert_eq!(command.key_algorithm, KeyAlgorithm::Gost3410_2012_256);
+    }
+
+    #[test]
+    fn parses_gosuslugi_bridge_command_without_cert() {
+        let command = GosuslugiBridgeCommand::parse([
+            OsString::from("--key-uri"),
+            OsString::from("rutoken:slot=0;id=%03"),
+            OsString::from("--pin-env"),
+            OsString::from("TOKEN_PIN"),
+        ])
+        .expect("command should parse");
+
+        assert_eq!(command.cert, None);
+        assert_eq!(command.cert_record, None);
+        assert_eq!(command.bind, "127.0.0.1:18765");
+    }
+
+    #[test]
+    fn parses_gosuslugi_bridge_command_with_cert_record() {
+        let temp = TempDir::new();
+        let cert_record = temp.write_file("cert-record.json", "{}");
+
+        let command = GosuslugiBridgeCommand::parse([
+            OsString::from("--cert-record"),
+            cert_record.clone().into_os_string(),
+            OsString::from("--key-uri"),
+            OsString::from("rutoken:slot=0;id=%03"),
+            OsString::from("--pin-env"),
+            OsString::from("TOKEN_PIN"),
+        ])
+        .expect("command should parse");
+
+        assert_eq!(command.cert, None);
+        assert_eq!(command.cert_record.as_deref(), Some(cert_record.as_path()));
+    }
+
+    #[test]
+    fn parses_ccid_read_cert_command() {
+        let temp = TempDir::new();
+        let output = temp.path().join("rutoken-cert.der");
+        let exchange_log = temp.path().join("read-cert.log");
+
+        let command = CcidReadCertCommand::parse([
+            OsString::from("--output"),
+            output.clone().into_os_string(),
+            OsString::from("--key-uri"),
+            OsString::from("rutoken:slot=0;id=%03"),
+            OsString::from("--pin-env"),
+            OsString::from("TOKEN_PIN"),
+            OsString::from("--ccid-reader"),
+            OsString::from("Rutoken ECP"),
+            OsString::from("--exchange-log"),
+            exchange_log.clone().into_os_string(),
+        ])
+        .expect("command should parse");
+
+        assert_eq!(command.output, output);
+        assert_eq!(command.key_uri, "rutoken:slot=0;id=%03");
+        assert_eq!(command.pin_env.as_deref(), Some("TOKEN_PIN"));
+        assert_eq!(command.ccid_reader.as_deref(), Some("Rutoken ECP"));
         assert_eq!(
             command.exchange_log.as_deref(),
             Some(exchange_log.as_path())
@@ -2844,7 +4172,7 @@ mod tests {
                 .signature_oid(DigestAlgorithm::Gost3411_2012_256)
                 .expect("valid combination")
                 .to_string(),
-            "1.2.643.7.1.1.1.1"
+            "1.2.643.7.1.1.3.2"
         );
         // ECDSA
         assert_eq!(
@@ -3040,7 +4368,9 @@ mod tests {
             true,
         );
 
-        let error = cms_envelope::build_signed_data_der(&input, b"hello", Vec::new())
+        let (signed_attrs, _) = cms_envelope::prepare_signed_attributes(&input)
+            .expect("signed attributes should encode");
+        let error = cms_envelope::build_signed_data_der(&input, b"hello", Vec::new(), signed_attrs)
             .expect_err("empty signatures should fail");
 
         assert!(matches!(error, CliError::Message(message) if message.contains("signature")));
@@ -3166,12 +4496,11 @@ mod tests {
         let digest = (0u8..32).collect::<Vec<_>>();
         let apdu = rutoken::pso_compute_digital_signature(&digest, 64);
         let bytes = apdu.to_bytes().expect("APDU should serialize");
-        let expected_digest = (0u8..32).rev().collect::<Vec<_>>();
 
-        // CLA INS P1 P2 Lc=32 reversed digest[0..32] Le=64
+        // CLA INS P1 P2 Lc=32 digest[0..32] Le=64
         assert_eq!(&bytes[..4], [0x00, 0x2A, 0x9E, 0x9A]);
         assert_eq!(bytes[4], 32);
-        assert_eq!(&bytes[5..37], expected_digest.as_slice());
+        assert_eq!(&bytes[5..37], digest.as_slice());
         assert_eq!(bytes[37], 64);
     }
 
@@ -3180,11 +4509,10 @@ mod tests {
         let digest = (0u8..64).collect::<Vec<_>>();
         let apdu = rutoken::pso_compute_digital_signature(&digest, 128);
         let bytes = apdu.to_bytes().expect("APDU should serialize");
-        let expected_digest = (0u8..64).rev().collect::<Vec<_>>();
 
         assert_eq!(&bytes[..4], [0x00, 0x2A, 0x9E, 0x9A]);
         assert_eq!(bytes[4], 64);
-        assert_eq!(bytes[5..69], expected_digest[..]);
+        assert_eq!(bytes[5..69], digest[..]);
         assert_eq!(bytes[69], 128);
     }
 

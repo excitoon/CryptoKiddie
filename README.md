@@ -2,6 +2,8 @@
 
 Minimal native Rust CLI for building a self-contained document-signing path around token-backed cryptographic keys without an OpenSSL dependency.
 
+The project name is currently `CryptoKiddie`; `CryptoKittie` is also under consideration as an alternate name.
+
 ## Direction
 
 The signing path is native Rust plus token hardware. It does not shell out to OpenSSL or rely on OpenSSL provider configuration:
@@ -86,12 +88,80 @@ cargo run -- ccid-sign-raw \
 
 `TOKEN_PIN` can be read from the environment or from the local `.env` file. `.env` is ignored by git and should not be committed.
 
+### Gosuslugi Safari bridge
+
+The Gosuslugi organization creation page currently looks for the JavaScript bridge object `gosuslugiPluginCrypto`. Normally that object is supplied by the Госуслуги/КриптоПро browser-plugin stack. CryptoKiddie can serve a small localhost replacement for the subset observed on `https://lk.gosuslugi.ru/org-profile/create/org`:
+
+- `certificates(...)` returns the configured signer certificate in the shape expected by the page;
+- `signature(...)` accepts the page's base64 document payload, signs it through the Rutoken CCID path, and returns an attached CMS object as base64.
+
+Start the bridge with a DER certificate that matches the Rutoken private key:
+
+```bash
+cargo run -- gosuslugi-bridge \
+  --key-uri 'rutoken:slot=0;id=%03' \
+  --ccid-reader 'Rutoken ECP' \
+  --exchange-log logs/gosuslugi-bridge.log \
+  --pin-env TOKEN_PIN
+```
+
+If Safari blocks page JavaScript from calling the localhost bridge directly, inject queue mode and pump queued plugin calls from outside Safari:
+
+```bash
+osascript - "$PWD/browser/gosuslugi-inject.js" <<'APPLESCRIPT'
+on run argv
+  set injectPath to item 1 of argv
+  tell application "Safari"
+    repeat with w in windows
+      repeat with t in tabs of w
+        if (URL of t) contains "gosuslugi" then
+          do JavaScript "window.__CRYPTOKIDDIE_GOSUSLUGI_FORCE_QUEUE = true; window.gosuslugiPluginCrypto = undefined;" in t
+          do JavaScript (read POSIX file injectPath) in t
+          return
+        end if
+      end repeat
+    end repeat
+  end tell
+end run
+APPLESCRIPT
+
+browser/gosuslugi-safari-pump-once.rb
+```
+
+When a DER certificate cannot be read from the token yet, `--cert-record` can serve the certificate-listing metadata expected by the Gosuslugi frontend:
+
+```bash
+cargo run -- gosuslugi-bridge \
+  --cert-record target/gosuslugi-cert-record.json \
+  --key-uri 'rutoken:slot=0;id=%03' \
+  --ccid-reader 'Rutoken ECP' \
+  --exchange-log logs/gosuslugi-bridge.log \
+  --pin-env TOKEN_PIN
+```
+
+The record must use OID-keyed DN fields such as `2.5.4.3` for common name, `2.5.4.10` for organization, `1.2.643.100.3` for SNILS, `1.2.643.100.4` for organization INN, and `1.2.643.100.1` for OGRN. Metadata-only records let the page list/select a certificate, but signing still requires DER: provide `--cert` or include base64 DER in the record's `raw` field.
+
+When `--cert` and `--cert-record` are omitted, the bridge attempts to read the matching certificate from likely Rutoken/OpenSC certificate files. On the tested token, signing key `id=%03` is present but the public certificate file was not found. To retry/export a token-stored certificate explicitly:
+
+```bash
+cargo run -- ccid-read-cert \
+  --output target/rutoken-cert.der \
+  --key-uri 'rutoken:slot=0;id=%03' \
+  --ccid-reader 'Rutoken ECP' \
+  --exchange-log logs/ccid-read-cert.log \
+  --pin-env TOKEN_PIN
+```
+
+Then inject [browser/gosuslugi-inject.js](browser/gosuslugi-inject.js) into the Safari tab. If the page has already failed certificate search, reload it after injection so the marker `meta[property="gosuslugi.plugin.extension.content"]` is present before the app checks for plugin availability.
+
+The bridge is intentionally local-only by default (`127.0.0.1:18765`). It does not install CryptoPro CSP, the CryptoPro Browser Plugin, or Rutoken vendor drivers.
+
 ### Rutoken ECP Notes
 
 - Private key material does not leave the Rutoken. The host selects a key reference and asks the token to sign; the token returns only the signature bytes.
 - The algorithm and key capabilities are not secret in the same way as the private key. They are stored or enforced by the token and may also be visible through PKCS#15 metadata, PKCS#11 attributes, public keys, or certificates.
-- The current direct CCID path does not yet parse PKCS#15 metadata or read certificates/public keys. It uses the OpenSC-derived GOST signing flow explicitly and addresses the discovered private key as `rutoken:slot=0;id=%03`.
-- The tested signing flow computes `ГОСТ Р 34.11-2012-256` on the host, sends the digest to the token in Rutoken ECP byte order, and receives a 64-byte `ГОСТ Р 34.10-2012` signature.
+- The current direct CCID path reads the certificate from the OpenSC-derived certificate file path and signs through the OpenSC-derived GOST signing flow explicitly. It still does not fully parse PKCS#15 metadata or enumerate all public keys.
+- The tested signing flow computes `ГОСТ Р 34.11-2012-256` on the host, sends the digest to the token in native digest order, and reverses the returned 64-byte `ГОСТ Р 34.10-2012` signature before CMS encoding. This byte-order combination passed Госуслуги `crtcheck`.
 - Rutoken ECP PIN references follow Aktiv/OpenSC conventions: administrator/SO PIN ref `1`, normal user PIN ref `2`. Signing uses the user PIN ref `2`.
 - The tested token accepted the `.env` PIN only on user PIN ref `2`; using ref `1` queried the wrong PIN object. The tested signing key reference is `0x03`; `0x01` and `0x02` did not contain the private key file.
 - OpenSC behavior mirrored by the direct driver: `6300` after VERIFY is followed by a no-data VERIFY status query, and `6f86` after VERIFY is handled by `LOGOUT` (`80 40 00 00`) plus one VERIFY retry.
@@ -101,8 +171,8 @@ cargo run -- ccid-sign-raw \
 
 | `--digest`    | `--key-algorithm`     | Signing OID                  |
 |---------------|-----------------------|------------------------------|
-| `gost12-256`  | `gost3410-2012-256`   | 1.2.643.7.1.1.1.1            |
-| `gost12-512`  | `gost3410-2012-512`   | 1.2.643.7.1.1.1.2            |
+| `gost12-256`  | `gost3410-2012-256`   | 1.2.643.7.1.1.3.2            |
+| `gost12-512`  | `gost3410-2012-512`   | 1.2.643.7.1.1.3.3            |
 | `sha256`      | `ecdsa`               | 1.2.840.10045.4.3.2          |
 | `sha384`      | `ecdsa`               | 1.2.840.10045.4.3.3          |
 | `sha512`      | `ecdsa`               | 1.2.840.10045.4.3.4          |

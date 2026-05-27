@@ -3,13 +3,27 @@ name = "cryptokiddie"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+pcsc = ["dep:pcsc"]
+
+[[bin]]
+name = "rutoken_probe"
+path = "src/bin/rutoken_probe.rs"
+required-features = ["pcsc"]
+
 [dependencies]
+base64 = "0.22.1"
 cms = { version = "0.3.0-pre.2", features = ["std"] }
 const-oid = "0.10.2"
 cryptoki = "0.12.0"
 cryptoki-sys = "0.5.0"
 der = "0.8.0"
+pcsc = { version = "2.9.0", optional = true }
 rusb = "0.9"
+serde = { version = "1.0.217", features = ["derive"] }
+serde_json = "1.0.135"
 sha2 = "0.10.8"
 spki = "0.8.0"
 streebog = "0.11.0"
+x509-cert = "0.3.0-rc.4"
