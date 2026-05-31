@@ -5,6 +5,19 @@ use std::{
     path::{Path, PathBuf},
 };
 
+pub mod gost28147;
+pub mod gost_bridge;
+pub mod gost_client;
+pub mod gost_ec;
+pub mod gost_handshake;
+pub mod gost_keytransport;
+pub mod gost_keywrap;
+pub mod gost_login;
+pub mod gost_prf;
+pub mod gost_record;
+pub mod gost_vko;
+pub mod tls;
+
 pub mod apdu {
     use super::CliError;
 
@@ -618,7 +631,10 @@ pub mod ccid {
             (0x00, 0xA4, 0x00, 0x0C) => "SELECT_MF",
             (0x00, 0x20, _, _) => "VERIFY_PIN",
             (0x00, 0x22, 0x41, 0xB6) => "MSE_SET_DST",
+            (0x00, 0x22, 0x41, 0xA6) => "MSE_SET_KEY_AGREEMENT",
+            (0x00, 0x22, 0x41, 0xB8) => "MSE_SET_KEY_AGREEMENT",
             (0x00, 0x2A, 0x9E, 0x9A) => "PSO_COMPUTE_DIGITAL_SIGNATURE",
+            (0x00, 0x2A, 0x80, 0x86) => "PSO_KEY_AGREEMENT",
             _ => "APDU",
         }
     }
@@ -833,6 +849,121 @@ pub mod rutoken {
             .with_data([0x10, 0x00, 0x10, 0x00, 0x60, 0x02, 0x00, key_id])
     }
 
+    /// SELECT File: the per-key SE-RSF EF under 3F00/1000/1000/6005, required by
+    /// the on-card GOST VKO (key-agreement security environment). On stock
+    /// tokens this EF (`6005:<key_id>`) is absent until provisioned with
+    /// [`create_se_rsf_file_for_vko`].
+    pub fn select_se_rsf_file(key_id: u8) -> CommandApdu {
+        CommandApdu::new(0x00, 0xA4, 0x08, 0x0C)
+            .with_data([0x10, 0x00, 0x10, 0x00, 0x60, 0x05, 0x00, key_id])
+    }
+
+    /// Build the CREATE FILE APDU that provisions the missing SE-RSF EF
+    /// (`6005:<key_id>`) used by on-card VKO. The on-wire format below is the
+    /// one the token firmware accepts: the size TLV (`80 …`) is emitted *before*
+    /// the descriptor TLV (`82 …`); the opposite order is rejected (6a89) on this
+    /// firmware, so field order matters.
+    ///
+    /// On-wire (44 bytes, `INS=E0` CREATE FILE):
+    /// ```text
+    /// 00 E0 00 00 27
+    /// 62 25                       FCP template (37 bytes)
+    ///    80 02 00 <size>          file size  (= record length - 11)
+    ///    82 02 10 00              file descriptor
+    ///    83 02 00 <key_id>        file id (low byte = key_id)
+    ///    85 06 1F 00 00 FF 00 00  proprietary SE-RSF descriptor
+    ///    86 0F 47 <conditions…>   ACL: hdr 0x47 (ops 0,1,2,6) + 14 cond/pad bytes
+    /// ```
+    /// `conditions` is the 14-byte SecureAttr body following the `47` header
+    /// (seven condition slots + seven pad bytes). The reference value `0x02`
+    /// means USER PIN; mirror the sibling key EF (`02 02 02 00 00 00 02` + pad).
+    /// The four enforced condition bytes depend on runtime card state and cannot
+    /// be derived statically, so the caller must supply them explicitly.
+    ///
+    /// This is a **builder only** — it never transmits. Provisioning writes
+    /// persistent card state (reversible via a USER-PIN DELETE FILE) and must
+    /// only be performed with explicit user consent.
+    pub fn create_se_rsf_file_for_vko(key_id: u8, size: u8, conditions: [u8; 14]) -> CommandApdu {
+        let mut fcp = vec![
+            0x80, 0x02, 0x00, size, // file size (emitted first)
+            0x82, 0x02, 0x10, 0x00, // file descriptor
+            0x83, 0x02, 0x00, key_id, // file id (low byte = key_id)
+            0x85, 0x06, 0x1F, 0x00, 0x00, 0xFF, 0x00, 0x00, // proprietary descriptor
+            0x86, 0x0F, 0x47, // ACL: tag, len 15, header bitmask 0x47
+        ];
+        fcp.extend_from_slice(&conditions);
+        let mut data = vec![0x62, fcp.len() as u8];
+        data.extend_from_slice(&fcp);
+        CommandApdu::new(0x00, 0xE0, 0x00, 0x00).with_data(data)
+    }
+
+    /// Build the CREATE FILE APDU in the alternate dialect used when the card was
+    /// personalised by a GOST Cryptographic Service Provider (CSP) rather than
+    /// the PKCS#11 module. This is a *different dialect* from the PKCS#11
+    /// [`create_se_rsf_file_for_vko`]: the card's key object is owned by the CSP
+    /// dialect, which is why the PKCS#11 create is refused (6a89) while this one
+    /// was never tried.
+    ///
+    /// CSP here means *Cryptographic Service Provider*: a Microsoft CryptoAPI
+    /// provider module that implements the GOST algorithms and drives the token;
+    /// it owns the on-card key objects it provisions, hence the distinct CREATE
+    /// FILE dialect reproduced here.
+    ///
+    /// On-wire (44 bytes, `INS=E0` CREATE FILE):
+    /// ```text
+    /// 00 E0 00 00 27
+    /// 62 25                          FCP template (37 bytes)
+    ///    82 02 10 00                 file descriptor       (DESC before SIZE)
+    ///    80 02 00 <size>             file size  = 2 * coord_len  (0x40 for GOST-256)
+    ///    83 02 00 <key_id>           file id (low byte = key_id)
+    ///    85 06 <r0> <hh> <r2> FF 00 00   proprietary SE-RSF descriptor
+    ///    86 0F 46 00 02 00 …(12×00)  ACL: header 0x46 (ops 1,2,6) + 14 body bytes
+    /// ```
+    /// Decoded derivation of the variable prop-attr (`85 06 …`) bytes:
+    /// * `r0` = `(coord_len == 0x20 ? 0x03 : 0x43) | 0x10`  → `0x13` for GOST-256.
+    /// * `hh` = letter-gate of `coord_len`: A→0x20 B→0x30 C→0x40 T→0x10
+    ///   E→0x50 F→0x20 G→0x30 H→0x40, else `0x00`. For `coord_len = 0x20` → `0x00`.
+    /// * `r2` = caller flags from the CSP orchestration; cannot be pinned from
+    ///   the descriptor format alone, so it is passed in explicitly (`prop_flags`).
+    ///
+    /// `key_id` and `prop_flags` are the only bytes that depend on runtime card
+    /// state; everything else is derived here exactly as the binary does.
+    ///
+    /// This is a **builder only** — it never transmits. Provisioning writes
+    /// persistent card state (reversible via a USER-PIN DELETE FILE) and must
+    /// only be performed with explicit user consent on a present session.
+    pub fn create_se_rsf_file_csp(key_id: u8, coord_len: u8, prop_flags: u8) -> CommandApdu {
+        let size = coord_len.wrapping_mul(2); // r11b = r15 + r15
+        let r0 = if coord_len == 0x20 { 0x03 } else { 0x43 } | 0x10; // cmovne + or 0x10
+        let hh = se_rsf_letter_gate(coord_len);
+        let fcp = vec![
+            0x82, 0x02, 0x10, 0x00, // file descriptor (emitted before size)
+            0x80, 0x02, 0x00, size, // file size = 2 * coord_len
+            0x83, 0x02, 0x00, key_id, // file id (low byte = key_id)
+            0x85, 0x06, r0, hh, prop_flags, 0xFF, 0x00, 0x00, // proprietary descriptor
+            0x86, 0x0F, 0x46, // ACL: tag, len 15, header bitmask 0x46
+            0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, // 7 condition slots
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 7 pad bytes
+        ];
+        let mut data = vec![0x62, fcp.len() as u8];
+        data.extend_from_slice(&fcp);
+        CommandApdu::new(0x00, 0xE0, 0x00, 0x00).with_data(data)
+    }
+
+    /// Letter→code map used to derive the
+    /// middle byte of the SE-RSF proprietary descriptor (`85 06 r0 hh …`).
+    /// Returns `0x00` for any input that is not one of the recognised letters.
+    pub(crate) fn se_rsf_letter_gate(b: u8) -> u8 {
+        match b {
+            b'A' | b'F' => 0x20,
+            b'B' | b'G' => 0x30,
+            b'C' | b'H' => 0x40,
+            b'T' => 0x10,
+            b'E' => 0x50,
+            _ => 0x00,
+        }
+    }
+
     /// SELECT File: Rutoken ECP certificate EF under 3F00/1000/1000/6004.
     pub fn select_certificate_file(key_id: u8) -> CommandApdu {
         let file_id = certificate_file_id(key_id);
@@ -982,6 +1113,84 @@ pub mod rutoken {
         CommandApdu::new(0x00, 0x2A, 0x9E, 0x9A)
             .with_data(digest.to_vec())
             .with_le(signature_len)
+    }
+
+    /// MSE SET (Manage Security Environment, SET, Key-Agreement Template).
+    ///
+    /// Selects the private key `key_id` and cryptographic mechanism `algo` for
+    /// the following PERFORM SECURITY OPERATION key-agreement command (GOST VKO).
+    ///
+    /// This is the key-agreement analogue of
+    /// [`manage_security_environment_for_signing`]; the Control Reference
+    /// Template tag is `A6` (key agreement) instead of `B6` (digital signature).
+    ///
+    /// On-wire APDU (validated live against the Osnovanie Rutoken ECP):
+    /// `00 22 41 B8 06  95 01 40  84 01 <key_id>`
+    /// where `B8` is the Confidentiality / key-agreement Control Reference
+    /// Template (this card rejects the `A6` template with `6a80`), `95 01 40` =
+    /// Usage Qualifier "key agreement / decipher", and `84 01 key_id` =
+    /// private-key reference. No `80` cryptographic-mechanism CRDO is needed —
+    /// the paramset is taken from the selected key — so `algo` is accepted for
+    /// backwards compatibility but only appended (as `80 01 algo`) when non-zero.
+    pub fn manage_security_environment_for_vko(key_id: u8, algo: u8) -> CommandApdu {
+        manage_security_environment_for_vko_with_ukm(key_id, algo, &[])
+    }
+
+    /// MSE SET for VKO with an optional User Keying Material (UKM) operand.
+    ///
+    /// Identical to [`manage_security_environment_for_vko`] but appends the UKM
+    /// as a `87 <len> <ukm>` CRDO inside the control-reference template, after
+    /// the `80` mechanism CRDO. The build order is
+    /// `95 01 40 · 84 01 <key_id> · [80 01 <algo>] · [87 <Lu> <ukm>]`,
+    /// where `appendTlv(body, 0x87, ukm)` is emitted only when `ukm` is
+    /// non-empty. Passing an empty `ukm` reproduces the original APDU exactly.
+    pub fn manage_security_environment_for_vko_with_ukm(
+        key_id: u8,
+        algo: u8,
+        ukm: &[u8],
+    ) -> CommandApdu {
+        let mut data = vec![0x95, 0x01, 0x40, 0x84, 0x01, key_id];
+        if algo != 0 {
+            data.extend_from_slice(&[0x80, 0x01, algo]);
+        }
+        if !ukm.is_empty() {
+            data.push(0x87);
+            data.push(ukm.len() as u8);
+            data.extend_from_slice(ukm);
+        }
+        CommandApdu::new(0x00, 0x22, 0x41, 0xB8).with_data(data)
+    }
+
+    /// PSO: PERFORM SECURITY OPERATION — GOST VKO key agreement.
+    ///
+    /// Presents the peer public point (already in Rutoken token-point byte order,
+    /// see [`pubkey_to_token_point`]) and returns the shared-secret / KEK bytes.
+    ///
+    /// On-wire APDU: `00 2A 80 86 <Lc> <peer_token_point…>`.
+    pub fn pso_key_agreement(peer_token_point: &[u8]) -> CommandApdu {
+        CommandApdu::new(0x00, 0x2A, 0x80, 0x86).with_data(peer_token_point.to_vec())
+    }
+
+    /// Convert a raw GOST public point `X‖Y` (big-endian per coordinate) into the
+    /// Rutoken "token point" format expected by [`pso_key_agreement`].
+    ///
+    /// The card stores and consumes each affine coordinate in little-endian byte
+    /// order, so each `coord_len`-byte half is reversed independently.
+    /// `coord_len` is 32 for GOST-2012-256
+    /// and 64 for GOST-2012-512.
+    pub fn pubkey_to_token_point(pubkey_xy: &[u8], coord_len: usize) -> Result<Vec<u8>, CliError> {
+        if coord_len == 0 || pubkey_xy.len() != coord_len * 2 {
+            return Err(CliError::Usage(format!(
+                "VKO peer public key must be {} bytes (X||Y), got {}",
+                coord_len * 2,
+                pubkey_xy.len()
+            )));
+        }
+        let mut point = Vec::with_capacity(pubkey_xy.len());
+        for chunk in pubkey_xy.chunks_exact(coord_len) {
+            point.extend(chunk.iter().rev().copied());
+        }
+        Ok(point)
     }
 
     /// READ BINARY from the currently selected transparent EF.
@@ -1395,6 +1604,27 @@ pub mod token {
         read_certificate_direct(config, uri.id, pin.as_deref())
     }
 
+    /// Perform a hardware GOST VKO (key agreement) against the Rutoken ECP token.
+    ///
+    /// Runs the native Rutoken ECP key-agreement exchange:
+    /// SELECT MF → VERIFY PIN → SELECT private-key file → MSE SET (key-agreement
+    /// template) → PSO (key agreement). Returns the shared-secret / KEK bytes the
+    /// card produces from the peer public key.
+    ///
+    /// `peer_public_xy` is the peer GOST public point as `X‖Y` big-endian
+    /// (64 bytes for GOST-2012-256). `algo` is the card-reported cryptographic
+    /// mechanism byte for the target paramset (see [`super::rutoken`] docs).
+    pub fn derive_vko(
+        config: &CcidSignerConfig,
+        peer_public_xy: &[u8],
+        algo: u8,
+        ukm: &[u8],
+    ) -> Result<Vec<u8>, CliError> {
+        let uri = super::rutoken::RutokenUri::parse(&config.key_uri)?;
+        let pin: Option<Vec<u8>> = config.pin_env.as_deref().map(load_pin_bytes).transpose()?;
+        derive_vko_direct(config, uri.id, pin.as_deref(), peer_public_xy, algo, ukm)
+    }
+
     enum ApduDevice {
         Ccid(super::ccid::CcidDevice),
         #[cfg(feature = "pcsc")]
@@ -1513,6 +1743,51 @@ pub mod token {
         }
 
         Ok(super::rutoken::signature_from_token(resp.data))
+    }
+
+    fn derive_vko_direct(
+        config: &CcidSignerConfig,
+        key_id: u8,
+        pin: Option<&[u8]>,
+        peer_public_xy: &[u8],
+        algo: u8,
+        ukm: &[u8],
+    ) -> Result<Vec<u8>, CliError> {
+        let coord_len = peer_public_xy.len() / 2;
+        let token_point = super::rutoken::pubkey_to_token_point(peer_public_xy, coord_len)?;
+
+        let mut device = ApduDevice::open(config)?;
+        let resp = device.transmit(&super::rutoken::select_master_file())?;
+        if !resp.is_success() {
+            return Err(CliError::Message(format!(
+                "SELECT MF failed: SW {:02x}{:02x}",
+                resp.sw1, resp.sw2
+            )));
+        }
+
+        verify_pin_if_present(&mut device, pin)?;
+
+        select_private_key_file(&mut device, key_id)?;
+
+        let resp = device.transmit(
+            &super::rutoken::manage_security_environment_for_vko_with_ukm(key_id, algo, ukm),
+        )?;
+        if !resp.is_success() {
+            return Err(CliError::Message(format!(
+                "MSE SET key agreement (key 0x{key_id:02x}, algo 0x{algo:02x}) failed: SW {:02x}{:02x}",
+                resp.sw1, resp.sw2
+            )));
+        }
+
+        let resp = device.transmit(&super::rutoken::pso_key_agreement(&token_point))?;
+        if !resp.is_success() {
+            return Err(CliError::Message(format!(
+                "PSO key agreement failed: SW {:02x}{:02x}",
+                resp.sw1, resp.sw2
+            )));
+        }
+
+        Ok(resp.data)
     }
 
     fn read_certificate_direct(
@@ -2746,6 +3021,57 @@ pub struct GosuslugiBridgeCommand {
     pub exchange_log: Option<PathBuf>,
 }
 
+/// Live mutual-auth GOST TLS 1.2 login (cipher suite 0xFF85) over a token.
+///
+/// Connects to `host:port`, runs the full handshake via
+/// [`gost_login::run_login`], using the Rutoken for the VKO key agreement and
+/// the `CertificateVerify` signature, then sends one HTTP request over the
+/// established channel and prints the response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GostLoginCommand {
+    pub host: String,
+    pub port: u16,
+    pub timeout_secs: u64,
+    pub key_uri: String,
+    pub pin_env: String,
+    pub ccid_reader: Option<String>,
+    pub exchange_log: Option<PathBuf>,
+    /// Card-reported VKO mechanism/paramset byte for the target key.
+    pub vko_algo: u8,
+    /// Treat the certificate's stored public point as little-endian per
+    /// coordinate (reverse each 32-byte half to big-endian `X‖Y` before the
+    /// token VKO). RFC 4491 stores GOST coordinates little-endian, but the exact
+    /// order the token expects has no offline oracle, so it is selectable.
+    pub peer_key_little_endian: bool,
+    /// HTTP request target path (e.g. `/`); used to build a minimal GET.
+    pub request_path: String,
+    /// Optional client leaf certificate (DER) loaded from a file instead of
+    /// reading it off the token. The signing key on the token still produces the
+    /// CertificateVerify signature; only the certificate bytes come from here.
+    pub client_cert: Option<PathBuf>,
+}
+
+/// `gost-bridge`: a local HTTP reverse proxy in front of a GOST mutual-TLS
+/// endpoint (suite 0xFF85). The browser talks plain HTTP to `bind`; each request
+/// triggers a fresh token-authenticated GOST handshake to `host:port`, the
+/// request is replayed upstream, and the rewritten response is returned. A
+/// server-side cookie jar keeps the authenticated session (`PHPSESSID`) alive
+/// across the short-lived upstream connections.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GostBridgeCommand {
+    /// Local address to listen on for the browser, e.g. `127.0.0.1:18888`.
+    pub bind: String,
+    pub host: String,
+    pub port: u16,
+    pub timeout_secs: u64,
+    pub key_uri: String,
+    pub pin_env: String,
+    pub ccid_reader: Option<String>,
+    pub exchange_log: Option<PathBuf>,
+    /// Optional client leaf certificate (DER) from a file instead of the token.
+    pub client_cert: Option<PathBuf>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CliError {
     Message(String),
@@ -2794,6 +3120,18 @@ where
         }
         Some(command) if command == "gosuslugi-bridge" => {
             let command = GosuslugiBridgeCommand::parse(args)?;
+            command.run()
+        }
+        Some(command) if command == "tls-probe" => {
+            let command = TlsProbeCommand::parse(args)?;
+            command.run()
+        }
+        Some(command) if command == "gost-login" => {
+            let command = GostLoginCommand::parse(args)?;
+            command.run()
+        }
+        Some(command) if command == "gost-bridge" => {
+            let command = GostBridgeCommand::parse(args)?;
             command.run()
         }
         Some(command) => Err(CliError::Usage(format!(
@@ -3600,6 +3938,1136 @@ fn hex_nibble(byte: u8) -> Option<u8> {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct TlsProbeCommand {
+    host: String,
+    port: u16,
+    timeout_secs: u64,
+}
+
+impl TlsProbeCommand {
+    fn parse<I>(args: I) -> Result<Self, CliError>
+    where
+        I: IntoIterator<Item = OsString>,
+    {
+        let mut host: Option<String> = None;
+        let mut port: u16 = 443;
+        let mut timeout_secs: u64 = 10;
+
+        let mut args = args.into_iter();
+        while let Some(arg) = args.next() {
+            let arg = arg.to_string_lossy().into_owned();
+            match arg.as_str() {
+                "--host" => {
+                    host = Some(
+                        args.next()
+                            .ok_or_else(|| CliError::Usage("--host requires a value".into()))?
+                            .to_string_lossy()
+                            .into_owned(),
+                    );
+                }
+                "--port" => {
+                    let value = args
+                        .next()
+                        .ok_or_else(|| CliError::Usage("--port requires a value".into()))?
+                        .to_string_lossy()
+                        .into_owned();
+                    port = value
+                        .parse()
+                        .map_err(|_| CliError::Usage(format!("invalid --port: {value}")))?;
+                }
+                "--timeout" => {
+                    let value = args
+                        .next()
+                        .ok_or_else(|| CliError::Usage("--timeout requires a value".into()))?
+                        .to_string_lossy()
+                        .into_owned();
+                    timeout_secs = value
+                        .parse()
+                        .map_err(|_| CliError::Usage(format!("invalid --timeout: {value}")))?;
+                }
+                other => {
+                    return Err(CliError::Usage(format!(
+                        "unknown tls-probe option: {other}"
+                    )));
+                }
+            }
+        }
+
+        let host = host.ok_or_else(|| CliError::Usage("tls-probe requires --host".into()))?;
+        Ok(Self {
+            host,
+            port,
+            timeout_secs,
+        })
+    }
+
+    fn run(&self) -> Result<String, CliError> {
+        use std::time::{Duration, SystemTime, UNIX_EPOCH};
+        use tls::{ClientHello, TlsTransport, cipher_suite};
+
+        // ClientHello.random: 4-byte gmt_unix_time + 28 nonce bytes. Without a
+        // CSPRNG dependency, derive deterministic-but-unique nonce bytes from the
+        // clock; this is sufficient for a probe (the secure handshake stage will
+        // supply real entropy).
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|e| CliError::Message(format!("clock error: {e}")))?;
+        let mut random = [0u8; 32];
+        random[..4].copy_from_slice(&(now.as_secs() as u32).to_be_bytes());
+        let nanos = now.subsec_nanos() as u64 ^ (now.as_secs().wrapping_mul(0x9E3779B97F4A7C15));
+        for (i, slot) in random[4..].iter_mut().enumerate() {
+            *slot = (nanos.rotate_left((i as u32) * 7) & 0xFF) as u8;
+        }
+
+        let hello = ClientHello::new_gost(self.host.clone(), random);
+        let mut transport = TlsTransport::connect(
+            &self.host,
+            self.port,
+            Duration::from_secs(self.timeout_secs),
+        )?;
+        let flight = transport.opening_handshake(&hello)?;
+
+        let suite_name = match flight.server_hello.cipher_suite {
+            cipher_suite::GOSTR341112_256_WITH_KUZNYECHIK_CTR_OMAC => {
+                "TLS_GOSTR341112_256_WITH_KUZNYECHIK_CTR_OMAC"
+            }
+            cipher_suite::GOSTR341112_256_WITH_MAGMA_CTR_OMAC => {
+                "TLS_GOSTR341112_256_WITH_MAGMA_CTR_OMAC"
+            }
+            cipher_suite::GOSTR341112_256_WITH_28147_CNT_IMIT => {
+                "TLS_GOSTR341112_256_WITH_28147_CNT_IMIT"
+            }
+            cipher_suite::LEGACY_GOSTR341112_256_WITH_28147_CNT_IMIT => {
+                "TLS_GOSTR341112_256_WITH_28147_CNT_IMIT (legacy 0xFF85)"
+            }
+            cipher_suite::LEGACY_GOSTR341001_WITH_28147_CNT_IMIT => {
+                "TLS_GOSTR341001_WITH_28147_CNT_IMIT (legacy)"
+            }
+            other => {
+                return Ok(format!(
+                    "connected to {}:{} — server negotiated NON-GOST suite 0x{other:04X}; \
+                     server may not be a GOST endpoint or requires a different ClientHello",
+                    self.host, self.port
+                ));
+            }
+        };
+
+        let mut out = String::new();
+        let _ = writeln!(
+            out,
+            "GOST TLS handshake reached ServerHelloDone with {}:{}",
+            self.host, self.port
+        );
+        let version_name = match (
+            flight.server_hello.server_version.0,
+            flight.server_hello.server_version.1,
+        ) {
+            (3, 3) => "1.2",
+            (3, 2) => "1.1",
+            (3, 1) => "1.0",
+            _ => "unknown",
+        };
+        let _ = writeln!(
+            out,
+            "  negotiated version: TLS {} ({}.{})",
+            version_name,
+            flight.server_hello.server_version.0,
+            flight.server_hello.server_version.1
+        );
+        let _ = writeln!(
+            out,
+            "  negotiated suite:   0x{:04X} {}",
+            flight.server_hello.cipher_suite, suite_name
+        );
+        let _ = writeln!(
+            out,
+            "  certificates:       {} in chain",
+            flight.certificates.len()
+        );
+        if let Some(leaf) = flight.certificates.first() {
+            let _ = writeln!(out, "  leaf cert size:     {} bytes (DER)", leaf.len());
+        }
+        let _ = writeln!(
+            out,
+            "  ServerKeyExchange:  {}",
+            if flight.server_key_exchange.is_some() {
+                "present"
+            } else {
+                "absent"
+            }
+        );
+        let _ = writeln!(
+            out,
+            "  CertificateRequest: {}",
+            if flight.certificate_request.is_some() {
+                "present (mutual TLS — client cert needed)"
+            } else {
+                "absent"
+            }
+        );
+        let _ = write!(
+            out,
+            "  next stage: GOST VKO key exchange + record encryption (token-backed)"
+        );
+        Ok(out)
+    }
+}
+
+/// Reorder a GOST R 34.10-2012-256 signature for the RFC 9189 §4.2.5
+/// CertificateVerify `digitally-signed` block, where `sgn = str_l(r) | str_l(s)`
+/// (little-endian r, then little-endian s).
+///
+/// The input is the CMS-order signature returned by the token signer (a full
+/// byte-reverse of the card's native PSO output). The exact mapping is selected
+/// by the `GOST_TLS_SIG_ORDER` environment variable so it can be confirmed
+/// against the live server:
+/// - `rev` (default): reverse the whole value (native card order)
+/// - `asis`: pass the CMS value through unchanged
+/// - `swap`: swap the two 32-byte halves
+/// - `revhalves`: reverse each 32-byte half independently
+fn tls_certificate_verify_signature(cms: Vec<u8>) -> Vec<u8> {
+    let mode = std::env::var("GOST_TLS_SIG_ORDER").unwrap_or_else(|_| "rev".to_string());
+    if cms.len() != 64 {
+        // Unexpected length: leave untouched.
+        return cms;
+    }
+    match mode.as_str() {
+        "asis" => cms,
+        "swap" => {
+            let mut out = Vec::with_capacity(64);
+            out.extend_from_slice(&cms[32..64]);
+            out.extend_from_slice(&cms[0..32]);
+            out
+        }
+        "revhalves" => {
+            let mut out = Vec::with_capacity(64);
+            out.extend(cms[0..32].iter().rev().copied());
+            out.extend(cms[32..64].iter().rev().copied());
+            out
+        }
+        // "rev" and anything else: full reverse (= card's native byte order).
+        _ => cms.into_iter().rev().collect(),
+    }
+}
+
+/// Perform one token-authenticated GOST TLS 1.2 (suite 0xFF85) request:
+/// connect to `host:port`, run the full mutual-auth handshake with the token
+/// signing the `CertificateVerify`, send `request_bytes` as ApplicationData,
+/// and drain the complete response. Returns `(response_bytes, server_leaf_len)`.
+///
+/// Each call is a fresh handshake and re-presents the token PIN, because the
+/// upstream closes the connection after every response (`Connection: close`).
+fn gost_mtls_request(
+    host: &str,
+    port: u16,
+    timeout_secs: u64,
+    signer: &token::CcidSignerConfig,
+    client_chain: &[Vec<u8>],
+    request_bytes: &[u8],
+) -> Result<(Vec<u8>, usize), CliError> {
+    use std::time::Duration;
+    use tls::{TlsTransport, cipher_suite};
+
+    let entropy = read_os_random(64)?;
+    let mut client_random = [0u8; 32];
+    client_random.copy_from_slice(&entropy[..32]);
+    let mut premaster = [0u8; 32];
+    premaster.copy_from_slice(&entropy[32..]);
+
+    let mut transport = TlsTransport::connect(host, port, Duration::from_secs(timeout_secs))?;
+
+    let params = gost_login::LoginParams {
+        server_name: host,
+        client_random,
+        premaster,
+        client_cert_chain: client_chain,
+        cipher_suites: &[cipher_suite::LEGACY_GOSTR341112_256_WITH_28147_CNT_IMIT],
+    };
+
+    let mut session = gost_login::run_login(
+        &mut transport,
+        &params,
+        |buf| getrandom::getrandom(buf).map_err(|e| e.to_string()),
+        |digest| {
+            use token::TokenSigner as _;
+            let sig = signer
+                .sign_digest(DigestAlgorithm::Gost3411_2012_256, digest)
+                .map_err(|e| e.to_string())?;
+            Ok(tls_certificate_verify_signature(sig))
+        },
+    )
+    .map_err(|e| CliError::Message(format!("gost-mtls handshake failed: {e}")))?;
+
+    let leaf_len = session.server_leaf_cert().len();
+
+    session
+        .send_application_data(&mut transport, request_bytes)
+        .map_err(|e| CliError::Message(format!("send request failed: {e}")))?;
+    let response = session
+        .recv_all_application_data(&mut transport)
+        .map_err(|e| CliError::Message(format!("read response failed: {e}")))?;
+
+    Ok((response, leaf_len))
+}
+
+/// Sign `content` as a detached CAdES-style CMS SignedData (GOST R 34.10-2012-256
+/// + Streebog-256) using the token, returning the base64 of the CMS DER.
+///
+/// This mirrors `sign_file` but takes raw bytes instead of a base64 document.
+/// The signed attributes are the minimal CMS set (contentType + messageDigest);
+/// `messageDigest` = Streebog-256(content). Used for the ФНС ЛКЮЛ in-page
+/// certificate-login challenge (the content is the UTF-8 bytes of the
+/// `challenge` string returned by `GET api/auth/challenge`).
+fn sign_detached_cms_b64(
+    signer: &token::CcidSignerConfig,
+    certificate_der: Vec<u8>,
+    content: &[u8],
+) -> Result<String, CliError> {
+    use base64::Engine as _;
+
+    let digest_algorithm = DigestAlgorithm::Gost3411_2012_256;
+    let key_algorithm = KeyAlgorithm::Gost3410_2012_256;
+    let digest = compute_digest(content, digest_algorithm);
+    let cms_input = cms_envelope::CmsSigningInput::new(
+        digest,
+        digest_algorithm,
+        key_algorithm,
+        certificate_der,
+        true,
+    );
+    let (signed_attrs, signed_attrs_der) = cms_envelope::prepare_signed_attributes(&cms_input)?;
+    let signed_attrs_digest = compute_digest(&signed_attrs_der, digest_algorithm);
+    let signature =
+        token::TokenSigner::sign_digest(signer, digest_algorithm, &signed_attrs_digest)?;
+    let cms_der =
+        cms_envelope::build_signed_data_der(&cms_input, content, signature, signed_attrs)?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(cms_der))
+}
+
+impl GostLoginCommand {
+    fn parse<I>(args: I) -> Result<Self, CliError>
+    where
+        I: IntoIterator<Item = OsString>,
+    {
+        let mut host: Option<String> = None;
+        let mut port: u16 = 443;
+        let mut timeout_secs: u64 = 15;
+        let mut key_uri: Option<String> = None;
+        let mut pin_env: Option<String> = None;
+        let mut ccid_reader: Option<String> = None;
+        let mut exchange_log: Option<PathBuf> = None;
+        let mut vko_algo: Option<u8> = None;
+        let mut peer_key_little_endian = false;
+        let mut request_path = String::from("/");
+        let mut client_cert: Option<PathBuf> = None;
+
+        let mut iter = args.into_iter();
+        while let Some(arg) = iter.next() {
+            match arg.to_string_lossy().as_ref() {
+                "--host" => host = Some(next_value(&mut iter, "--host")?.to_string_lossy().into()),
+                "--port" => {
+                    let value = next_value(&mut iter, "--port")?
+                        .to_string_lossy()
+                        .into_owned();
+                    port = value
+                        .parse()
+                        .map_err(|_| CliError::Usage(format!("invalid --port: {value}")))?;
+                }
+                "--timeout" => {
+                    let value = next_value(&mut iter, "--timeout")?
+                        .to_string_lossy()
+                        .into_owned();
+                    timeout_secs = value
+                        .parse()
+                        .map_err(|_| CliError::Usage(format!("invalid --timeout: {value}")))?;
+                }
+                "--key-uri" => {
+                    key_uri = Some(next_value(&mut iter, "--key-uri")?.to_string_lossy().into())
+                }
+                "--pin-env" => {
+                    pin_env = Some(next_value(&mut iter, "--pin-env")?.to_string_lossy().into())
+                }
+                "--ccid-reader" => {
+                    ccid_reader = Some(
+                        next_value(&mut iter, "--ccid-reader")?
+                            .to_string_lossy()
+                            .into(),
+                    )
+                }
+                "--exchange-log" => {
+                    exchange_log = Some(PathBuf::from(next_value(&mut iter, "--exchange-log")?))
+                }
+                "--vko-algo" => {
+                    let value = next_value(&mut iter, "--vko-algo")?
+                        .to_string_lossy()
+                        .into_owned();
+                    let trimmed = value.strip_prefix("0x").unwrap_or(&value);
+                    vko_algo = Some(u8::from_str_radix(trimmed, 16).map_err(|_| {
+                        CliError::Usage(format!("invalid --vko-algo (expect hex byte): {value}"))
+                    })?);
+                }
+                "--peer-key-le" => peer_key_little_endian = true,
+                "--request-path" => {
+                    request_path = next_value(&mut iter, "--request-path")?
+                        .to_string_lossy()
+                        .into_owned();
+                }
+                "--client-cert" => {
+                    client_cert = Some(PathBuf::from(next_value(&mut iter, "--client-cert")?))
+                }
+                "--help" | "-h" => return Err(CliError::Usage(usage())),
+                other => {
+                    return Err(CliError::Usage(format!(
+                        "unknown gost-login option: {other}"
+                    )));
+                }
+            }
+        }
+
+        let command = Self {
+            host: required_string(host, "--host")?,
+            port,
+            timeout_secs,
+            key_uri: required_string(key_uri, "--key-uri")?,
+            pin_env: required_string(pin_env, "--pin-env")?,
+            ccid_reader,
+            exchange_log,
+            // `--vko-algo` / `--peer-key-le` are legacy no-ops: the 0xFF85 suite
+            // uses a software ephemeral key (RFC 9189), not a token VKO.
+            vko_algo: vko_algo.unwrap_or(0),
+            peer_key_little_endian,
+            request_path,
+            client_cert,
+        };
+        rutoken::RutokenUri::parse(&command.key_uri)?;
+        Ok(command)
+    }
+
+    fn run(&self) -> Result<String, CliError> {
+        let signer = token::CcidSignerConfig::new(
+            self.ccid_reader.clone(),
+            self.key_uri.clone(),
+            Some(self.pin_env.clone()),
+            KeyAlgorithm::Gost3410_2012_256,
+            self.exchange_log.clone(),
+        );
+
+        // Client certificate chain (leaf): from a file if given, else read off
+        // the token.
+        let client_leaf = match &self.client_cert {
+            Some(path) => fs::read(path).map_err(|e| {
+                CliError::Message(format!("read client cert {}: {e}", path.display()))
+            })?,
+            None => token::read_certificate_der(&signer)?,
+        };
+        let client_chain = vec![client_leaf];
+
+        // Send a minimal HTTP/1.1 GET over the established channel.
+        let request = format!(
+            "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nAccept: */*\r\n\r\n",
+            self.request_path, self.host
+        );
+        let (response, leaf_len) = gost_mtls_request(
+            &self.host,
+            self.port,
+            self.timeout_secs,
+            &signer,
+            &client_chain,
+            request.as_bytes(),
+        )?;
+
+        let mut out = String::new();
+        let _ = writeln!(
+            out,
+            "GOST TLS 1.2 login to {}:{} succeeded (server Finished verified)",
+            self.host, self.port
+        );
+        let _ = writeln!(out, "  server leaf cert: {leaf_len} bytes (DER)");
+        let _ = writeln!(out, "  --- response ({} bytes) ---", response.len());
+        let _ = write!(out, "{}", String::from_utf8_lossy(&response));
+        Ok(out)
+    }
+}
+
+impl GostBridgeCommand {
+    fn parse<I>(args: I) -> Result<Self, CliError>
+    where
+        I: IntoIterator<Item = OsString>,
+    {
+        let mut bind = String::from("127.0.0.1:18888");
+        let mut host: Option<String> = None;
+        let mut port: u16 = 443;
+        let mut timeout_secs: u64 = 15;
+        let mut key_uri: Option<String> = None;
+        let mut pin_env: Option<String> = None;
+        let mut ccid_reader: Option<String> = None;
+        let mut exchange_log: Option<PathBuf> = None;
+        let mut client_cert: Option<PathBuf> = None;
+
+        let mut iter = args.into_iter();
+        while let Some(arg) = iter.next() {
+            match arg.to_string_lossy().as_ref() {
+                "--bind" => bind = next_value(&mut iter, "--bind")?.to_string_lossy().into(),
+                "--host" => host = Some(next_value(&mut iter, "--host")?.to_string_lossy().into()),
+                "--port" => {
+                    let value = next_value(&mut iter, "--port")?
+                        .to_string_lossy()
+                        .into_owned();
+                    port = value
+                        .parse()
+                        .map_err(|_| CliError::Usage(format!("invalid --port: {value}")))?;
+                }
+                "--timeout" => {
+                    let value = next_value(&mut iter, "--timeout")?
+                        .to_string_lossy()
+                        .into_owned();
+                    timeout_secs = value
+                        .parse()
+                        .map_err(|_| CliError::Usage(format!("invalid --timeout: {value}")))?;
+                }
+                "--key-uri" => {
+                    key_uri = Some(next_value(&mut iter, "--key-uri")?.to_string_lossy().into())
+                }
+                "--pin-env" => {
+                    pin_env = Some(next_value(&mut iter, "--pin-env")?.to_string_lossy().into())
+                }
+                "--ccid-reader" => {
+                    ccid_reader = Some(
+                        next_value(&mut iter, "--ccid-reader")?
+                            .to_string_lossy()
+                            .into(),
+                    )
+                }
+                "--exchange-log" => {
+                    exchange_log = Some(PathBuf::from(next_value(&mut iter, "--exchange-log")?))
+                }
+                "--client-cert" => {
+                    client_cert = Some(PathBuf::from(next_value(&mut iter, "--client-cert")?))
+                }
+                "--help" | "-h" => return Err(CliError::Usage(usage())),
+                other => {
+                    return Err(CliError::Usage(format!(
+                        "unknown gost-bridge option: {other}"
+                    )));
+                }
+            }
+        }
+
+        let command = Self {
+            bind,
+            host: required_string(host, "--host")?,
+            port,
+            timeout_secs,
+            key_uri: required_string(key_uri, "--key-uri")?,
+            pin_env: required_string(pin_env, "--pin-env")?,
+            ccid_reader,
+            exchange_log,
+            client_cert,
+        };
+        rutoken::RutokenUri::parse(&command.key_uri)?;
+        Ok(command)
+    }
+
+    fn run(&self) -> Result<String, CliError> {
+        use gost_bridge::{CookieJar, build_upstream_request, read_request, rewrite_response};
+        use std::io::Write as _;
+        use std::net::TcpListener;
+
+        let signer = token::CcidSignerConfig::new(
+            self.ccid_reader.clone(),
+            self.key_uri.clone(),
+            Some(self.pin_env.clone()),
+            KeyAlgorithm::Gost3410_2012_256,
+            self.exchange_log.clone(),
+        );
+
+        // Load the client leaf certificate once (from a file, or the token) so
+        // the per-request handshakes reuse it.
+        let client_leaf = match &self.client_cert {
+            Some(path) => fs::read(path).map_err(|e| {
+                CliError::Message(format!("read client cert {}: {e}", path.display()))
+            })?,
+            None => token::read_certificate_der(&signer)?,
+        };
+        let client_chain = vec![client_leaf];
+
+        let listener = TcpListener::bind(&self.bind)
+            .map_err(|e| CliError::Message(format!("bind {}: {e}", self.bind)))?;
+        let local = listener
+            .local_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_else(|_| self.bind.clone());
+        let bridge_origin = format!("http://{local}");
+
+        eprintln!(
+            "gost-bridge listening on {bridge_origin} -> https://{}:{} (GOST 0xFF85, token-authenticated)",
+            self.host, self.port
+        );
+        eprintln!(
+            "  open {bridge_origin}/ in your browser; each request triggers a fresh token handshake (PIN is re-presented)."
+        );
+
+        let mut jar = CookieJar::new();
+
+        for incoming in listener.incoming() {
+            let mut stream = match incoming {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("gost-bridge: accept error: {e}");
+                    continue;
+                }
+            };
+
+            let req = match read_request(&stream) {
+                Ok(Some(r)) => r,
+                Ok(None) => continue, // idle keep-alive closed
+                Err(e) => {
+                    eprintln!("gost-bridge: request parse error: {e}");
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+                    );
+                    continue;
+                }
+            };
+
+            let target = req.origin_form_target();
+            eprintln!("gost-bridge: {} {target}", req.method);
+
+            // Bridge-internal endpoint: expose the loaded client certificate to
+            // the injected `window.cadesplugin` shim so its emulated CAPICOM
+            // store enumerates the *real* signer cert (subject, validity, SHA-1
+            // thumbprint). The page renders the real identity in its picker; the
+            // actual token signing still happens server-side.
+            if target == "/__bridge/cert-info" || target.starts_with("/__bridge/cert-info?") {
+                let body = match Self::cert_info_json(&client_chain) {
+                    Ok(json) => json,
+                    Err(e) => {
+                        eprintln!("gost-bridge: cert-info failed: {e}");
+                        format!("{{\"error\":{:?}}}", e.to_string())
+                    }
+                };
+                let mut msg = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nCache-Control: no-store\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
+                    body.len()
+                )
+                .into_bytes();
+                msg.extend_from_slice(body.as_bytes());
+                let _ = stream.write_all(&msg);
+                let _ = stream.flush();
+                continue;
+            }
+
+            // Serve the GOST signing plugin's `cadesplugin_api.js` loader as our
+            // in-page emulation (no extension), so the SPA's dynamic script load does
+            // not pull the real extension-dependent loader and clobber the shim.
+            if std::env::var_os("CK_NO_SHIM").is_none() && (target.contains("cadesplugin_api.js")) {
+                let body = gost_bridge::CADESPLUGIN_SHIM_JS.as_bytes();
+                let mut msg = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/javascript; charset=utf-8\r\nCache-Control: no-store\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
+                    body.len()
+                )
+                .into_bytes();
+                msg.extend_from_slice(body);
+                let _ = stream.write_all(&msg);
+                let _ = stream.flush();
+                eprintln!("gost-bridge: served cadesplugin_api.js shim");
+                continue;
+            }
+
+            // Bridge-internal endpoint: perform the in-page certificate login
+            // server-side (token signs the auth challenge) so the shared
+            // PHPSESSID becomes authenticated without the browser plugin.
+            if target == "/__bridge/login" || target.starts_with("/__bridge/login?") {
+                let (status_html, body_html) =
+                    match self.perform_bridge_login(&signer, &client_chain, &mut jar) {
+                        Ok(msg) => ("200 OK", msg),
+                        Err(e) => {
+                            eprintln!("gost-bridge: login failed: {e}");
+                            if e.to_string().to_ascii_lowercase().contains("pin") {
+                                return Err(e);
+                            }
+                            (
+                                "502 Bad Gateway",
+                                format!("<h1>Login failed</h1><pre>{e}</pre>"),
+                            )
+                        }
+                    };
+                let page = format!(
+                    "<!doctype html><meta charset=\"utf-8\">\
+                     <meta http-equiv=\"refresh\" content=\"2; url=/\">\
+                     <body style=\"font-family:sans-serif\">{body_html}\
+                     <p>Redirecting to the portal…</p></body>"
+                );
+                let mut msg = format!(
+                    "HTTP/1.1 {status_html}\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
+                    page.len()
+                )
+                .into_bytes();
+                msg.extend_from_slice(page.as_bytes());
+                let _ = stream.write_all(&msg);
+                let _ = stream.flush();
+                continue;
+            }
+
+            // Intercept the SPA's own certificate-login POST. The injected
+            // `window.cadesplugin` shim lets the browser proceed past the dead
+            // GOST signing plugin and POST here with *dummy* signature/certificate
+            // values; we discard them and perform the real token-backed
+            // GET+sign+POST, then hand the genuine upstream JSON (e.g. the
+            // `registration_required` 400) back to the SPA so it renders its own
+            // native next screen.
+            if req.method.eq_ignore_ascii_case("POST")
+                && (target == "/api/auth/challenge" || target.starts_with("/api/auth/challenge?"))
+            {
+                match self.auth_challenge_raw(&signer, &client_chain, &mut jar) {
+                    Ok((st, body)) => {
+                        let reason = match st {
+                            200..=299 => "OK",
+                            400 => "Bad Request",
+                            401 => "Unauthorized",
+                            403 => "Forbidden",
+                            _ => "Error",
+                        };
+                        eprintln!("gost-bridge: SPA auth/challenge intercepted -> HTTP {st}");
+                        let mut msg = format!(
+                            "HTTP/1.1 {st} {reason}\r\nContent-Type: application/json; charset=utf-8\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
+                            body.len()
+                        )
+                        .into_bytes();
+                        msg.extend_from_slice(&body);
+                        let _ = stream.write_all(&msg);
+                        let _ = stream.flush();
+                    }
+                    Err(e) => {
+                        eprintln!("gost-bridge: SPA auth/challenge failed: {e}");
+                        if e.to_string().to_ascii_lowercase().contains("pin") {
+                            return Err(e);
+                        }
+                        let body = format!(
+                            "{{\"code\":\"bridge_error\",\"message\":{:?}}}",
+                            e.to_string()
+                        );
+                        let mut msg = format!(
+                            "HTTP/1.1 502 Bad Gateway\r\nContent-Type: application/json; charset=utf-8\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
+                            body.len()
+                        )
+                        .into_bytes();
+                        msg.extend_from_slice(body.as_bytes());
+                        let _ = stream.write_all(&msg);
+                        let _ = stream.flush();
+                    }
+                }
+                continue;
+            }
+
+            // Intercept the SPA's Lk3 registration POST. The browser signs the
+            // agreement with the shim's placeholder `SignCades`, so we re-sign
+            // the real agreement on the token and forward the genuine form,
+            // returning the real upstream response (success or a true denial).
+            if req.method.eq_ignore_ascii_case("POST")
+                && (target == "/api/register" || target.starts_with("/api/register?"))
+            {
+                match self.register_raw(&signer, &client_chain, &mut jar, &req) {
+                    Ok((st, body)) => {
+                        let reason = match st {
+                            200..=299 => "OK",
+                            400 => "Bad Request",
+                            401 => "Unauthorized",
+                            403 => "Forbidden",
+                            _ => "Error",
+                        };
+                        eprintln!("gost-bridge: SPA register intercepted -> HTTP {st}");
+                        let mut msg = format!(
+                            "HTTP/1.1 {st} {reason}\r\nContent-Type: application/json; charset=utf-8\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
+                            body.len()
+                        )
+                        .into_bytes();
+                        msg.extend_from_slice(&body);
+                        let _ = stream.write_all(&msg);
+                        let _ = stream.flush();
+                    }
+                    Err(e) => {
+                        eprintln!("gost-bridge: SPA register failed: {e}");
+                        if e.to_string().to_ascii_lowercase().contains("pin") {
+                            return Err(e);
+                        }
+                        let body = format!(
+                            "{{\"code\":\"bridge_error\",\"message\":{:?}}}",
+                            e.to_string()
+                        );
+                        let mut msg = format!(
+                            "HTTP/1.1 502 Bad Gateway\r\nContent-Type: application/json; charset=utf-8\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
+                            body.len()
+                        )
+                        .into_bytes();
+                        msg.extend_from_slice(body.as_bytes());
+                        let _ = stream.write_all(&msg);
+                        let _ = stream.flush();
+                    }
+                }
+                continue;
+            }
+
+            let upstream_bytes = build_upstream_request(&req, &self.host, &jar);
+
+            let response = match gost_mtls_request(
+                &self.host,
+                self.port,
+                self.timeout_secs,
+                &signer,
+                &client_chain,
+                &upstream_bytes,
+            ) {
+                Ok((resp, _leaf_len)) => resp,
+                Err(e) => {
+                    eprintln!("gost-bridge: upstream request failed: {e}");
+                    let body = format!("gost-bridge upstream error: {e}");
+                    let mut msg = format!(
+                        "HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
+                        body.len()
+                    )
+                    .into_bytes();
+                    msg.extend_from_slice(body.as_bytes());
+                    let _ = stream.write_all(&msg);
+                    // Stop on the first failure: a bad PIN must not be retried.
+                    if e.to_string().to_ascii_lowercase().contains("pin") {
+                        return Err(e);
+                    }
+                    continue;
+                }
+            };
+
+            // The cadesplugin shim makes the portal's own React SPA drive an
+            // emulated CAdESCOM object model (no browser extension):
+            // readiness passes, the store enumerates the real signer cert, and
+            // SignCades returns a placeholder. The browser then POSTs to
+            // `/api/auth/challenge`, which the bridge intercepts and re-signs on
+            // the token (see above). Default ON; set `CK_NO_SHIM` to disable.
+            let response = if std::env::var_os("CK_NO_SHIM").is_some() {
+                response
+            } else {
+                gost_bridge::inject_cadesplugin_shim(response)
+            };
+            let rewritten = rewrite_response(&response, &self.host, &bridge_origin, &mut jar);
+            if let Err(e) = stream.write_all(&rewritten) {
+                eprintln!("gost-bridge: write to browser failed: {e}");
+            }
+            let _ = stream.flush();
+        }
+
+        Ok(String::from("gost-bridge listener stopped"))
+    }
+
+    /// Perform the ФНС ЛКЮЛ in-page certificate login server-side.
+    ///
+    /// 1. `GET /api/auth/challenge` (over a fresh token handshake, jar cookies)
+    ///    → JSON `{code, challenge}`.
+    /// 2. Sign the UTF-8 bytes of `challenge` as a detached CMS on the token.
+    /// 3. `POST /api/auth/challenge` as `multipart/form-data`
+    ///    `{signature, certificate, code}`.
+    /// 4. Absorb the resulting authenticated `Set-Cookie` into `jar`.
+    ///
+    /// The browser shares `jar`'s PHPSESSID, so after this the portal is logged
+    /// in. Returns a short HTML status fragment for the redirect page.
+    fn perform_bridge_login(
+        &self,
+        signer: &token::CcidSignerConfig,
+        client_chain: &[Vec<u8>],
+        jar: &mut gost_bridge::CookieJar,
+    ) -> Result<String, CliError> {
+        let (status2, body2) = self.auth_challenge_raw(signer, client_chain, jar)?;
+        if (200..400).contains(&status2) {
+            Ok(format!(
+                "<h1>Logged in to ЛКЮЛ</h1><p>Server responded HTTP {status2}; the portal session is now authenticated.</p>"
+            ))
+        } else {
+            Err(CliError::Message(format!(
+                "login POST returned HTTP {status2}: {}",
+                String::from_utf8_lossy(&body2)
+            )))
+        }
+    }
+
+    /// Run the real token-backed `GET`+sign+`POST /api/auth/challenge` flow and
+    /// return the raw upstream POST response `(status, body)` verbatim.
+    ///
+    /// Used both by [`perform_bridge_login`] (friendly redirect page) and by the
+    /// SPA `POST /api/auth/challenge` interceptor, which forwards the genuine
+    /// JSON (e.g. the `registration_required` 400) straight to the browser so
+    /// the portal's own React app renders its native next screen.
+    fn auth_challenge_raw(
+        &self,
+        signer: &token::CcidSignerConfig,
+        client_chain: &[Vec<u8>],
+        jar: &mut gost_bridge::CookieJar,
+    ) -> Result<(u16, Vec<u8>), CliError> {
+        use base64::Engine as _;
+        use gost_bridge::{absorb_response, build_multipart_form};
+
+        // --- Step 1: fetch the challenge ---------------------------------
+        let mut get_req = format!(
+            "GET /api/auth/challenge HTTP/1.1\r\nHost: {}\r\nAccept: application/json\r\nAccept-Encoding: identity\r\n",
+            self.host
+        );
+        if let Some(cookie) = jar.header_value() {
+            get_req.push_str(&format!("Cookie: {cookie}\r\n"));
+        }
+        get_req.push_str("Connection: close\r\n\r\n");
+
+        let (raw, _) = gost_mtls_request(
+            &self.host,
+            self.port,
+            self.timeout_secs,
+            signer,
+            client_chain,
+            get_req.as_bytes(),
+        )?;
+        let (status, body) = absorb_response(&raw, jar);
+        if status != 200 {
+            return Err(CliError::Message(format!(
+                "challenge request returned HTTP {status}: {}",
+                String::from_utf8_lossy(&body)
+            )));
+        }
+        let json: serde_json::Value = serde_json::from_slice(&body).map_err(|e| {
+            CliError::Message(format!(
+                "challenge response was not JSON ({e}): {}",
+                String::from_utf8_lossy(&body)
+            ))
+        })?;
+        let challenge = json
+            .get("challenge")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| CliError::Message("challenge response missing 'challenge'".into()))?;
+        let code = json
+            .get("code")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| CliError::Message("challenge response missing 'code'".into()))?;
+        eprintln!("gost-bridge: login challenge received (code={code})");
+
+        // --- Step 2: sign the challenge on the token ---------------------
+        let certificate_der = client_chain
+            .first()
+            .cloned()
+            .ok_or_else(|| CliError::Message("no client certificate loaded".into()))?;
+        let certificate_b64 = base64::engine::general_purpose::STANDARD.encode(&certificate_der);
+        let signature_b64 = sign_detached_cms_b64(signer, certificate_der, challenge.as_bytes())?;
+
+        // --- Step 3: POST the signed challenge as multipart/form-data ----
+        let boundary = "----CryptoKiddieGostBridgeBoundary7e3b";
+        let form = build_multipart_form(
+            &[
+                ("signature", signature_b64.as_str()),
+                ("certificate", certificate_b64.as_str()),
+                ("code", code),
+            ],
+            boundary,
+        );
+        let mut post_req = format!(
+            "POST /api/auth/challenge HTTP/1.1\r\nHost: {}\r\nContent-Type: multipart/form-data; boundary={boundary}\r\nContent-Length: {}\r\nAccept: application/json\r\nAccept-Encoding: identity\r\n",
+            self.host,
+            form.len()
+        )
+        .into_bytes();
+        if let Some(cookie) = jar.header_value() {
+            post_req.extend_from_slice(format!("Cookie: {cookie}\r\n").as_bytes());
+        }
+        post_req.extend_from_slice(b"Connection: close\r\n\r\n");
+        post_req.extend_from_slice(&form);
+
+        let (raw2, _) = gost_mtls_request(
+            &self.host,
+            self.port,
+            self.timeout_secs,
+            signer,
+            client_chain,
+            &post_req,
+        )?;
+        let (status2, body2) = absorb_response(&raw2, jar);
+        eprintln!("gost-bridge: login POST returned HTTP {status2}");
+        Ok((status2, body2))
+    }
+
+    /// Re-sign and forward the SPA's Lk3 registration POST.
+    ///
+    /// The browser posts `multipart/form-data` `{agreement, inn, email,
+    /// signature}` where `agreement` is a base64 string and `signature` is a
+    /// detached CMS over its *decoded* bytes. The injected shim's `SignCades`
+    /// returned only a placeholder, so we discard the incoming `signature`,
+    /// re-sign the real agreement on the token, and forward the genuine form
+    /// upstream — returning the real upstream `(status, body)` to the browser.
+    fn register_raw(
+        &self,
+        signer: &token::CcidSignerConfig,
+        client_chain: &[Vec<u8>],
+        jar: &mut gost_bridge::CookieJar,
+        req: &gost_bridge::HttpRequest,
+    ) -> Result<(u16, Vec<u8>), CliError> {
+        use base64::Engine as _;
+        use gost_bridge::{
+            absorb_response, build_multipart_form, multipart_boundary, parse_multipart_fields,
+        };
+
+        let content_type = req
+            .header("content-type")
+            .ok_or_else(|| CliError::Message("register POST missing Content-Type".into()))?;
+        let boundary = multipart_boundary(content_type)
+            .ok_or_else(|| CliError::Message("register POST is not multipart/form-data".into()))?;
+        let fields = parse_multipart_fields(&req.body, &boundary);
+        let get = |name: &str| {
+            fields
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, v)| String::from_utf8_lossy(v).into_owned())
+        };
+        let agreement = get("agreement")
+            .ok_or_else(|| CliError::Message("register POST missing 'agreement'".into()))?;
+        let inn = get("inn").unwrap_or_default();
+        let email = get("email").unwrap_or_default();
+
+        // The signed content is the *decoded* agreement bytes (the SPA passes
+        // messageFormat="base64", i.e. propset_Content = the base64 agreement
+        // with ContentEncoding=BASE64_TO_BINARY).
+        let agreement_bytes = base64::engine::general_purpose::STANDARD
+            .decode(agreement.trim())
+            .map_err(|e| CliError::Message(format!("agreement is not valid base64: {e}")))?;
+
+        let certificate_der = client_chain
+            .first()
+            .cloned()
+            .ok_or_else(|| CliError::Message("no client certificate loaded".into()))?;
+        let signature_b64 = sign_detached_cms_b64(signer, certificate_der, &agreement_bytes)?;
+
+        let boundary_out = "----CryptoKiddieGostBridgeRegister7e3b";
+        let form = build_multipart_form(
+            &[
+                ("agreement", agreement.as_str()),
+                ("inn", inn.as_str()),
+                ("email", email.as_str()),
+                ("signature", signature_b64.as_str()),
+            ],
+            boundary_out,
+        );
+        let mut post_req = format!(
+            "POST /api/register HTTP/1.1\r\nHost: {}\r\nContent-Type: multipart/form-data; boundary={boundary_out}\r\nContent-Length: {}\r\nAccept: application/json\r\nAccept-Encoding: identity\r\n",
+            self.host,
+            form.len()
+        )
+        .into_bytes();
+        if let Some(cookie) = jar.header_value() {
+            post_req.extend_from_slice(format!("Cookie: {cookie}\r\n").as_bytes());
+        }
+        post_req.extend_from_slice(b"Connection: close\r\n\r\n");
+        post_req.extend_from_slice(&form);
+
+        let (raw, _) = gost_mtls_request(
+            &self.host,
+            self.port,
+            self.timeout_secs,
+            signer,
+            client_chain,
+            &post_req,
+        )?;
+        let (status, body) = absorb_response(&raw, jar);
+        eprintln!("gost-bridge: register POST returned HTTP {status} (email={email}, inn={inn})");
+        Ok((status, body))
+    }
+
+    /// Build the JSON consumed by the injected `window.cadesplugin` shim's
+    /// emulated CAPICOM store. Exposes the loaded client cert's SHA-1
+    /// thumbprint (the CAdESCOM `Thumbprint`), base64 DER, subject/issuer DN,
+    /// serial, and validity window so the SPA's certificate picker shows the
+    /// real signer identity.
+    fn cert_info_json(client_chain: &[Vec<u8>]) -> Result<String, CliError> {
+        use sha1::{Digest as _, Sha1};
+        let der = client_chain
+            .first()
+            .ok_or_else(|| CliError::Message("no client certificate loaded".into()))?;
+        let record = gosuslugi_bridge::certificate_record_from_der(der, "rutoken")?;
+        let thumbprint = hex_encode(&Sha1::digest(der)).to_uppercase();
+        let subject_cn = extract_common_name(&record.subject);
+        let subject = dn_to_capicom(&record.subject);
+        let issuer = dn_to_capicom(&record.issuer);
+        let json = serde_json::json!({
+            "thumbprint": thumbprint,
+            "certB64": record.raw,
+            "subject": subject,
+            "issuer": issuer,
+            "serialNumber": record.serial_number,
+            "notBefore": record.not_before,
+            "notAfter": record.not_after,
+            "subjectCN": subject_cn,
+        });
+        Ok(json.to_string())
+    }
+}
+
+/// Extract the common-name (`CN` / OID `2.5.4.3`) value from a `;`-separated DN.
+fn extract_common_name(dn: &str) -> String {
+    for part in dn.split([';', '\n']) {
+        let part = part.trim();
+        if let Some((key, value)) = part.split_once('=') {
+            let key = key.trim();
+            if key.eq_ignore_ascii_case("CN") || key == "2.5.4.3" {
+                return value.trim().to_string();
+            }
+        }
+    }
+    dn.trim().to_string()
+}
+
+/// Convert a `;`-separated DN (as produced by `certificate_record_from_der`)
+/// into the CAPICOM/CAdESCOM `SubjectName` form that the SPA's `reference implementation`
+/// parser expects: `KEY=VALUE` pairs joined by `, `, with values that contain
+/// commas or quotes wrapped in double quotes (internal quotes doubled).
+fn dn_to_capicom(dn: &str) -> String {
+    let mut out: Vec<String> = Vec::new();
+    for part in dn.split(';') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if let Some((key, value)) = part.split_once('=') {
+            let key = key.trim();
+            let value = value.trim();
+            if value.contains([',', '"', '+']) {
+                let escaped = value.replace('"', "\"\"");
+                out.push(format!("{key}=\"{escaped}\""));
+            } else {
+                out.push(format!("{key}={value}"));
+            }
+        } else {
+            out.push(part.to_string());
+        }
+    }
+    out.join(", ")
+}
+
+/// Reverse each 32-byte coordinate half of a 64-byte `X‖Y` point in place.
+#[cfg_attr(not(test), allow(dead_code))]
+fn reverse_coordinate_halves(point: &[u8]) -> Vec<u8> {
+    if point.len() != 64 {
+        // Unknown shape; return as-is and let the token reject it.
+        return point.to_vec();
+    }
+    let mut out = Vec::with_capacity(64);
+    out.extend(point[..32].iter().rev().copied());
+    out.extend(point[32..].iter().rev().copied());
+    out
+}
+
+/// Read `n` bytes of operating-system CSPRNG entropy (`/dev/urandom`).
+fn read_os_random(n: usize) -> Result<Vec<u8>, CliError> {
+    use std::io::Read as _;
+    let mut f = fs::File::open("/dev/urandom")
+        .map_err(|e| CliError::Message(format!("open /dev/urandom: {e}")))?;
+    let mut buf = vec![0u8; n];
+    f.read_exact(&mut buf)
+        .map_err(|e| CliError::Message(format!("read /dev/urandom: {e}")))?;
+    Ok(buf)
+}
+
 fn usage() -> String {
     String::from(
         "cryptokiddie <command> [options]\n\
@@ -3615,6 +5083,9 @@ fn usage() -> String {
                      ccid-sign-raw           Sign a document digest over direct CCID and write raw bytes\n\
                      ccid-read-cert          Read the Rutoken signer certificate to DER\n\
                      gosuslugi-bridge        Serve a localhost Gosuslugi plugin shim for Safari injection\n\
+                     tls-probe               Open a GOST TLS 1.2 connection and report the server flight\n\
+                     gost-login              Live mutual-auth GOST TLS 1.2 login over the Rutoken (0xFF85)\n\
+                     gost-bridge             Local HTTP proxy fronting a GOST mTLS site so a browser can use it\n\
          \n\
          Options:\n\
            --digest <NAME>           Hash algorithm: gost12-256 (default), gost12-512,\n\
@@ -3647,8 +5118,8 @@ fn usage() -> String {
 mod tests {
     use super::{
         CcidProbeCommand, CcidRawSignCommand, CcidReadCertCommand, CliError, DigestAlgorithm,
-        GosuslugiBridgeCommand, KeyAlgorithm, SignCommand, Transport, apdu, ccid, cms_envelope,
-        compute_digest, gost, run_cli, rutoken, token,
+        GostLoginCommand, GosuslugiBridgeCommand, KeyAlgorithm, SignCommand, Transport, apdu, ccid,
+        cms_envelope, compute_digest, gost, reverse_coordinate_halves, run_cli, rutoken, token,
     };
     use std::{
         env,
@@ -3789,6 +5260,77 @@ mod tests {
 
         assert_eq!(command.cert, None);
         assert_eq!(command.cert_record.as_deref(), Some(cert_record.as_path()));
+    }
+
+    #[test]
+    fn parses_gost_login_command() {
+        let command = GostLoginCommand::parse([
+            OsString::from("--host"),
+            OsString::from("lkulgost.nalog.ru"),
+            OsString::from("--key-uri"),
+            OsString::from("rutoken:slot=0;id=%03"),
+            OsString::from("--pin-env"),
+            OsString::from("TOKEN_PIN"),
+            OsString::from("--ccid-reader"),
+            OsString::from("Rutoken ECP"),
+            OsString::from("--vko-algo"),
+            OsString::from("0x40"),
+            OsString::from("--peer-key-le"),
+            OsString::from("--request-path"),
+            OsString::from("/index.html"),
+        ])
+        .expect("command should parse");
+
+        assert_eq!(command.host, "lkulgost.nalog.ru");
+        assert_eq!(command.port, 443);
+        assert_eq!(command.key_uri, "rutoken:slot=0;id=%03");
+        assert_eq!(command.pin_env, "TOKEN_PIN");
+        assert_eq!(command.ccid_reader.as_deref(), Some("Rutoken ECP"));
+        assert_eq!(command.vko_algo, 0x40);
+        assert!(command.peer_key_little_endian);
+        assert_eq!(command.request_path, "/index.html");
+    }
+
+    #[test]
+    fn gost_login_requires_host_and_vko_algo() {
+        // --vko-algo is now optional (legacy no-op): this parses.
+        let command = GostLoginCommand::parse([
+            OsString::from("--host"),
+            OsString::from("example.ru"),
+            OsString::from("--key-uri"),
+            OsString::from("rutoken:slot=0;id=%03"),
+            OsString::from("--pin-env"),
+            OsString::from("TOKEN_PIN"),
+        ])
+        .expect("command should parse without --vko-algo");
+        assert_eq!(command.host, "example.ru");
+
+        // Missing --host is still a usage error.
+        let err = GostLoginCommand::parse([
+            OsString::from("--key-uri"),
+            OsString::from("rutoken:slot=0;id=%03"),
+            OsString::from("--pin-env"),
+            OsString::from("TOKEN_PIN"),
+            OsString::from("--vko-algo"),
+            OsString::from("40"),
+        ])
+        .unwrap_err();
+        assert!(err.is_usage());
+    }
+
+    #[test]
+    fn reverse_coordinate_halves_flips_each_32_byte_half() {
+        let mut point = [0u8; 64];
+        for (i, b) in point.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        let flipped = reverse_coordinate_halves(&point);
+        assert_eq!(flipped[0], 31); // first half reversed: 31,30,...,0
+        assert_eq!(flipped[31], 0);
+        assert_eq!(flipped[32], 63); // second half reversed: 63,62,...,32
+        assert_eq!(flipped[63], 32);
+        // Non-64-byte input is returned unchanged.
+        assert_eq!(reverse_coordinate_halves(&[1, 2, 3]), vec![1, 2, 3]);
     }
 
     #[test]
@@ -4524,6 +6066,150 @@ mod tests {
         );
     }
 
+    #[test]
+    fn rutoken_mse_set_vko_apdu_bytes() {
+        // Validated live against the Osnovanie Rutoken ECP (the A6 template is
+        // rejected with 6a80; B8 is the accepted key-agreement CRT):
+        // 00 22 41 B8 06 95 01 40 84 01 <key_id>  (no 80-mechanism CRDO).
+        let apdu = rutoken::manage_security_environment_for_vko(0x03, 0x00);
+        let bytes = apdu.to_bytes().expect("APDU should serialize");
+        assert_eq!(
+            bytes,
+            vec![
+                0x00, 0x22, 0x41, 0xB8, 0x06, 0x95, 0x01, 0x40, 0x84, 0x01, 0x03
+            ]
+        );
+
+        // When a non-zero mechanism byte is supplied it is appended as 80 01 AA.
+        let apdu = rutoken::manage_security_environment_for_vko(0x03, 0x1E);
+        let bytes = apdu.to_bytes().expect("APDU should serialize");
+        assert_eq!(
+            bytes,
+            vec![
+                0x00, 0x22, 0x41, 0xB8, 0x09, 0x95, 0x01, 0x40, 0x84, 0x01, 0x03, 0x80, 0x01, 0x1E,
+            ]
+        );
+    }
+
+    #[test]
+    fn rutoken_mse_set_vko_with_ukm_apdu_bytes() {
+        // MSE build order: 95 01 40 · 84 01 KK · [80 01 AA] · 87 Lu <ukm>.
+        let ukm = [0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+        let apdu = rutoken::manage_security_environment_for_vko_with_ukm(0x03, 0x1E, &ukm);
+        let bytes = apdu.to_bytes().expect("APDU should serialize");
+        assert_eq!(
+            bytes,
+            vec![
+                0x00, 0x22, 0x41, 0xB8, 0x13, 0x95, 0x01, 0x40, 0x84, 0x01, 0x03, 0x80, 0x01, 0x1E,
+                0x87, 0x08, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+            ]
+        );
+
+        // Empty UKM reproduces the original APDU exactly.
+        let plain = rutoken::manage_security_environment_for_vko(0x03, 0x00)
+            .to_bytes()
+            .unwrap();
+        let via_ukm = rutoken::manage_security_environment_for_vko_with_ukm(0x03, 0x00, &[])
+            .to_bytes()
+            .unwrap();
+        assert_eq!(plain, via_ukm);
+    }
+
+    #[test]
+    fn rutoken_pso_key_agreement_apdu_bytes() {
+        // PSO key agreement: 00 2A 80 86 <Lc> <peer point>
+        let point = (0u8..64).collect::<Vec<_>>();
+        let apdu = rutoken::pso_key_agreement(&point);
+        let bytes = apdu.to_bytes().expect("APDU should serialize");
+        assert_eq!(&bytes[..4], [0x00, 0x2A, 0x80, 0x86]);
+        assert_eq!(bytes[4], 64);
+        assert_eq!(&bytes[5..69], point.as_slice());
+    }
+
+    #[test]
+    fn rutoken_create_se_rsf_file_apdu_bytes() {
+        // CREATE FILE for the SE-RSF EF: the size TLV (80) is emitted before the
+        // descriptor TLV (82). conditions = sibling key-EF ACL body (all USER PIN
+        // where enforced).
+        let conditions = [
+            0x02, 0x02, 0x02, 0x00, 0x00, 0x00, 0x02, // 7 condition slots
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 7 pad bytes
+        ];
+        let apdu = rutoken::create_se_rsf_file_for_vko(0x03, 0x42, conditions);
+        let bytes = apdu.to_bytes().expect("APDU should serialize");
+        assert_eq!(
+            bytes,
+            vec![
+                0x00, 0xE0, 0x00, 0x00, 0x27, // CREATE FILE, Lc=0x27
+                0x62, 0x25, // FCP template, len 37
+                0x80, 0x02, 0x00, 0x42, // file size (emitted first)
+                0x82, 0x02, 0x10, 0x00, // file descriptor
+                0x83, 0x02, 0x00, 0x03, // file id low byte = key_id
+                0x85, 0x06, 0x1F, 0x00, 0x00, 0xFF, 0x00, 0x00, // descriptor
+                0x86, 0x0F, 0x47, // ACL tag/len/hdr
+                0x02, 0x02, 0x02, 0x00, 0x00, 0x00, 0x02, // conditions
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // pad
+            ]
+        );
+    }
+
+    #[test]
+    fn rutoken_create_se_rsf_file_csp_apdu_bytes() {
+        // Alternate CSP CREATE FILE dialect: descriptor TLV (82) before size TLV
+        // (80), ACL header 0x46, prop-attr 85 06 <r0> <hh> <r2> FF 00 00. For the
+        // GOST-2012-256 case coord_len = 0x20 ⇒ size 0x40, r0 0x13, hh 0x00
+        // (letter gate default). prop_flags (r2) is caller-supplied.
+        let apdu = rutoken::create_se_rsf_file_csp(0x03, 0x20, 0x43);
+        let bytes = apdu.to_bytes().expect("APDU should serialize");
+        assert_eq!(
+            bytes,
+            vec![
+                0x00, 0xE0, 0x00, 0x00, 0x27, // CREATE FILE, Lc=0x27
+                0x62, 0x25, // FCP template, len 37
+                0x82, 0x02, 0x10, 0x00, // file descriptor (before size)
+                0x80, 0x02, 0x00, 0x40, // file size = 2 * 0x20
+                0x83, 0x02, 0x00, 0x03, // file id low byte = key_id
+                0x85, 0x06, 0x13, 0x00, 0x43, 0xFF, 0x00, 0x00, // descriptor
+                0x86, 0x0F, 0x46, // ACL tag/len/hdr (0x46)
+                0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, // conditions
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // pad
+            ]
+        );
+    }
+
+    #[test]
+    fn rutoken_se_rsf_letter_gate_values() {
+        // SE-RSF descriptor letter→code map.
+        assert_eq!(rutoken::se_rsf_letter_gate(b'A'), 0x20);
+        assert_eq!(rutoken::se_rsf_letter_gate(b'B'), 0x30);
+        assert_eq!(rutoken::se_rsf_letter_gate(b'C'), 0x40);
+        assert_eq!(rutoken::se_rsf_letter_gate(b'T'), 0x10);
+        assert_eq!(rutoken::se_rsf_letter_gate(b'E'), 0x50);
+        assert_eq!(rutoken::se_rsf_letter_gate(b'F'), 0x20);
+        assert_eq!(rutoken::se_rsf_letter_gate(b'G'), 0x30);
+        assert_eq!(rutoken::se_rsf_letter_gate(b'H'), 0x40);
+        assert_eq!(rutoken::se_rsf_letter_gate(0x20), 0x00); // GOST-256 coord len
+    }
+
+    #[test]
+    fn rutoken_pubkey_to_token_point_reverses_each_coordinate() {
+        // X = 01..20 (32 bytes), Y = 21..40 (32 bytes); each half reversed in place.
+        let mut xy = Vec::new();
+        xy.extend(1u8..=32); // X
+        xy.extend(33u8..=64); // Y
+        let point = rutoken::pubkey_to_token_point(&xy, 32).expect("64-byte key");
+
+        let mut expected = Vec::new();
+        expected.extend((1u8..=32).rev()); // X reversed
+        expected.extend((33u8..=64).rev()); // Y reversed
+        assert_eq!(point, expected);
+    }
+
+    #[test]
+    fn rutoken_pubkey_to_token_point_rejects_bad_length() {
+        assert!(rutoken::pubkey_to_token_point(&[0u8; 63], 32).is_err());
+    }
+
     // --- CCID protocol types ---
 
     #[test]
@@ -4704,11 +6390,14 @@ mod tests {
 
     impl TempDir {
         fn new() -> Self {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
             let unique = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .expect("time should be valid")
                 .as_nanos();
-            let path = env::temp_dir().join(format!("cryptokiddie-tests-{unique}"));
+            let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = env::temp_dir().join(format!("cryptokiddie-tests-{unique}-{seq}"));
             fs::create_dir_all(&path).expect("temp dir should be created");
             Self { path }
         }
