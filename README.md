@@ -154,7 +154,7 @@ cargo run -- ccid-read-cert \
 
 Then inject [browser/gosuslugi-inject.js](browser/gosuslugi-inject.js) into the Safari tab. If the page has already failed certificate search, reload it after injection so the marker `meta[property="gosuslugi.plugin.extension.content"]` is present before the app checks for plugin availability.
 
-The bridge is intentionally local-only by default (`127.0.0.1:18765`). It does not install CryptoPro CSP, the CryptoPro Browser Plugin, or Rutoken vendor drivers.
+The bridge is intentionally local-only by default (`127.0.0.1:18765`). It does not install any GOST CSP, browser crypto plugin, or Rutoken vendor drivers.
 
 ### Rutoken ECP Notes
 
@@ -181,6 +181,28 @@ The bridge is intentionally local-only by default (`127.0.0.1:18765`). It does n
 | `sha512`      | `rsa`                 | 1.2.840.113549.1.1.13        |
 
 When `--key-algorithm` is omitted, GOST digests default to `gost3410-2012-256`/`gost3410-2012-512` and SHA-2 digests default to `ecdsa`. Rutoken/GOST support is preserved through the generic PKCS#11 path; Rutoken USB identifiers are not hard-coded into the universal CCID dry-run output.
+
+## Electronic signature classes (eIDAS ↔ Russian)
+
+The signature a token can produce maps onto the eIDAS trust tiers as follows. "Cert" is the certificate class; "Device" is whether the signing key lives on a certified secure-signature-creation device (QSCD / сертифицированное СКЗИ).
+
+| Tier | Cert | Device | Russian | Note |
+|------|------|--------|---------|------|
+| SES | — | — | ПЭП / PEP | Simple e-signature (password, SMS OTP, scan); no cryptographic binding. |
+| AES (AdES) | any | any | УНЭП / UNEP | Advanced: uniquely linked, identifies signatory, sole control, tamper-evident. |
+| AdES-QC | qualified | not certified | (no exact RU tier) | Advanced signature backed by a qualified certificate, but key not on a QSCD. |
+| QES | qualified | QSCD (certified) | УКЭП / UKEP, КЭП / KEP | Qualified: AES + qualified certificate + certified device. Legally equal to a handwritten signature. |
+
+`УКЭП` (усиленная квалифицированная ЭП) and `КЭП` (квалифицированная ЭП) are the same top tier — `КЭП` is just the short form that drops *усиленная*. There is no "non-advanced" qualified tier: QES is defined as AES plus a qualified certificate plus a QSCD, so every QES is necessarily advanced.
+
+Russian law (63-ФЗ) defines only three legal types — `ПЭП`, `УНЭП`, and `УКЭП` — so `КЭП` is **not** a separate tier. It is colloquial shorthand for `УКЭП`: because every qualified signature is automatically advanced (*усиленная*), the «У» is redundant and routinely dropped. Both therefore map to the **same** English term, **QES**; English has no word that distinguishes them because there is nothing to distinguish. The only thing that varies is the literal transliteration:
+
+| Russian | Literal English | Legal tier |
+|---------|-----------------|------------|
+| КЭП     | "Qualified ES"          | QES |
+| УКЭП    | "Advanced Qualified ES" | QES |
+
+The tested Rutoken ECP holds a qualified certificate and is itself an ФСБ-certified СКЗИ (QSCD), so the signatures it produces are **QES / УКЭП**, which is why ESIA/Gosuslugi accepts it for `dsLoginAllowed` e-signature login.
 
 ## Current status
 
