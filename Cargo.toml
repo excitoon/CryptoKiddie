@@ -23,6 +23,7 @@ num-bigint = "0.4.6"
 num-integer = "0.1.46"
 num-traits = "0.2.19"
 getrandom = "0.2.15"
+native-tls = "0.2"
 pcsc = { version = "2.9.0", optional = true }
 rusb = "0.9"
 serde = { version = "1.0.217", features = ["derive"] }

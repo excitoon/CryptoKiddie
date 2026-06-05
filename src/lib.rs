@@ -4219,6 +4219,108 @@ fn gost_mtls_request(
 /// `messageDigest` = Streebog-256(content). Used for the ФНС ЛКЮЛ in-page
 /// certificate-login challenge (the content is the UTF-8 bytes of the
 /// `challenge` string returned by `GET api/auth/challenge`).
+/// Split a browser request target into `(upstream_host, origin_path)`.
+///
+/// A `/__up/<host>/<path>` target selects an explicit upstream host (how the
+/// bridge reaches the cabinet's sibling hosts, e.g. `mf-lk.nalog.ru`, after
+/// their absolute URLs are rewritten into this form); any other target uses the
+/// default host unchanged.
+fn route_upstream(target: &str, default_host: &str) -> (String, String) {
+    if let Some(rest) = target.strip_prefix("/__up/") {
+        let slash = rest.find('/').unwrap_or(rest.len());
+        let host = rest[..slash].to_string();
+        let path = if slash < rest.len() {
+            rest[slash..].to_string()
+        } else {
+            "/".to_string()
+        };
+        (host, path)
+    } else {
+        (default_host.to_string(), target.to_string())
+    }
+}
+
+/// Only ФНС hosts may be proxied, so the universal `/__up/` router cannot be
+/// turned into an open relay to arbitrary infrastructure.
+fn host_allowed(host: &str) -> bool {
+    let h = host.split(':').next().unwrap_or(host);
+    h == "nalog.ru" || h.ends_with(".nalog.ru")
+}
+
+/// Origins permitted to invoke the token-signing oracle (`/__bridge/sign`,
+/// `/__bridge/cert-info`): the ФНС registration page (when the shim is injected
+/// into the natively-loaded `service.nalog.ru` page), the bridge's own origin
+/// (proxy / same-origin case), or no `Origin` at all (local curl). Everything
+/// else is refused, so a foreign web page cannot drive the УКЭП.
+fn sign_origin_allowed(origin: &str, bridge_origin: &str) -> bool {
+    origin.is_empty() || origin == "https://service.nalog.ru" || origin == bridge_origin
+}
+
+/// `Access-Control-Allow-Origin` header line echoing an allowed `Origin`, or
+/// empty when there is none to echo.
+fn cors_allow_header(origin: &str) -> String {
+    if origin.is_empty() {
+        String::new()
+    } else {
+        format!("Access-Control-Allow-Origin: {origin}\r\n")
+    }
+}
+
+/// Proxy a request to a *plain-TLS* `*.nalog.ru` backend.
+///
+/// The cabinet's GOST auth front (`lkulgost.nalog.ru`) speaks GOST TLS with the
+/// token; its micro-frontend/API backend (`mf-lk.nalog.ru`) speaks ordinary
+/// TLS and authenticates by bearer token (issued by the `elk_sys_idp` service),
+/// not a client certificate — so it is reached over a standard TLS connection.
+///
+/// The backend's certificate is fully verified against the platform trust store
+/// (`*.nalog.ru`, issued by GlobalSign), so no verification is weakened.
+fn plain_tls_request(
+    host: &str,
+    port: u16,
+    timeout_secs: u64,
+    request: &[u8],
+) -> Result<Vec<u8>, CliError> {
+    use std::io::{Read, Write};
+    use std::net::{TcpStream, ToSocketAddrs};
+    use std::time::Duration;
+
+    let addr = format!("{host}:{port}");
+    let sockaddr = addr
+        .to_socket_addrs()
+        .map_err(|e| CliError::Message(format!("resolve {addr}: {e}")))?
+        .next()
+        .ok_or_else(|| CliError::Message(format!("no address for {addr}")))?;
+    let timeout = Duration::from_secs(timeout_secs);
+    let tcp = TcpStream::connect_timeout(&sockaddr, timeout)
+        .map_err(|e| CliError::Message(format!("connect {addr}: {e}")))?;
+    let _ = tcp.set_read_timeout(Some(timeout));
+    let _ = tcp.set_write_timeout(Some(timeout));
+
+    let connector = native_tls::TlsConnector::new()
+        .map_err(|e| CliError::Message(format!("tls connector: {e}")))?;
+    let mut stream = connector
+        .connect(host, tcp)
+        .map_err(|e| CliError::Message(format!("plain-tls handshake {host}: {e}")))?;
+
+    stream
+        .write_all(request)
+        .map_err(|e| CliError::Message(format!("write {host}: {e}")))?;
+    let _ = stream.flush();
+
+    // The request forces `Connection: close`, so the server closes the stream
+    // after the response and `read_to_end` returns the full bytes. A TLS
+    // close without `close_notify` surfaces as an error after the body — keep
+    // whatever we already read in that case.
+    let mut buf = Vec::new();
+    match stream.read_to_end(&mut buf) {
+        Ok(_) => {}
+        Err(_) if !buf.is_empty() => {}
+        Err(e) => return Err(CliError::Message(format!("read {host}: {e}"))),
+    }
+    Ok(buf)
+}
+
 fn sign_detached_cms_b64(
     signer: &token::CcidSignerConfig,
     certificate_der: Vec<u8>,
@@ -4519,7 +4621,7 @@ impl GostBridgeCommand {
                 }
             };
 
-            let req = match read_request(&stream) {
+            let mut req = match read_request(&stream) {
                 Ok(Some(r)) => r,
                 Ok(None) => continue, // idle keep-alive closed
                 Err(e) => {
@@ -4540,6 +4642,14 @@ impl GostBridgeCommand {
             // thumbprint). The page renders the real identity in its picker; the
             // actual token signing still happens server-side.
             if target == "/__bridge/cert-info" || target.starts_with("/__bridge/cert-info?") {
+                let req_origin = req.header("origin").unwrap_or("").to_string();
+                if !sign_origin_allowed(&req_origin, &bridge_origin) {
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+                    );
+                    continue;
+                }
+                let acao = cors_allow_header(&req_origin);
                 let body = match Self::cert_info_json(&client_chain) {
                     Ok(json) => json,
                     Err(e) => {
@@ -4548,7 +4658,7 @@ impl GostBridgeCommand {
                     }
                 };
                 let mut msg = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nCache-Control: no-store\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\n{acao}Cache-Control: no-store\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
                     body.len()
                 )
                 .into_bytes();
@@ -4558,11 +4668,110 @@ impl GostBridgeCommand {
                 continue;
             }
 
-            // Serve the GOST signing plugin's `cadesplugin_api.js` loader as our
-            // in-page emulation (no extension), so the SPA's dynamic script load does
-            // not pull the real extension-dependent loader and clobber the shim.
-            if std::env::var_os("CK_NO_SHIM").is_none() && (target.contains("cadesplugin_api.js")) {
-                let body = gost_bridge::CADESPLUGIN_SHIM_JS.as_bytes();
+            // Bridge-internal endpoint: sign arbitrary content on the token for
+            // the injected `cadesplugin` shim. CAdESCOM `SignedData` sets the
+            // document via `propset_Content` (+ encoding) then calls `SignCades`;
+            // the shim forwards `{content, encoding}` here. We sign the *real*
+            // document bytes on the Rutoken as a detached CMS (the same path ФНС
+            // accepted for login and the LK3 registration agreement) and return
+            // the base64 signature, so the SPA's own submit carries a valid УКЭП.
+            if req.method.eq_ignore_ascii_case("POST")
+                && (target == "/__bridge/sign" || target.starts_with("/__bridge/sign?"))
+            {
+                // Origin gate: confine the УКЭП signing oracle to the ФНС
+                // registration page (or local same-origin / non-browser). A
+                // foreign web page's cross-origin POST carries its own
+                // browser-set `Origin`, which JS cannot forge — so a malicious
+                // site cannot make the token sign on its behalf.
+                let req_origin = req.header("origin").unwrap_or("").to_string();
+                if !sign_origin_allowed(&req_origin, &bridge_origin) {
+                    eprintln!("gost-bridge: /__bridge/sign refused origin {req_origin:?}");
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+                    );
+                    continue;
+                }
+                let acao = cors_allow_header(&req_origin);
+                let signed = (|| -> Result<(String, usize), CliError> {
+                    use base64::Engine as _;
+                    let v: serde_json::Value = serde_json::from_slice(&req.body)
+                        .map_err(|e| CliError::Message(format!("sign: body not JSON: {e}")))?;
+                    let content = v.get("content").and_then(|x| x.as_str()).unwrap_or("");
+                    let encoding = v
+                        .get("encoding")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("base64");
+                    let bytes = match encoding {
+                        "ucs2le" => content
+                            .encode_utf16()
+                            .flat_map(|u| u.to_le_bytes())
+                            .collect::<Vec<u8>>(),
+                        "binary" => content.as_bytes().to_vec(),
+                        _ => base64::engine::general_purpose::STANDARD
+                            .decode(content.trim())
+                            .map_err(|e| {
+                                CliError::Message(format!("sign: content not base64: {e}"))
+                            })?,
+                    };
+                    let cert = client_chain
+                        .first()
+                        .cloned()
+                        .ok_or_else(|| CliError::Message("sign: no client certificate".into()))?;
+                    // Audit trail: persist the exact bytes about to be signed so
+                    // the operator can review the document before/after submit.
+                    let _ = std::fs::write("logs/usn-signed-content.bin", &bytes);
+                    let sig = sign_detached_cms_b64(&signer, cert, &bytes)?;
+                    Ok((sig, bytes.len()))
+                })();
+                let (status, reason, body) = match signed {
+                    Ok((sig, n)) => {
+                        eprintln!("gost-bridge: /__bridge/sign signed {n} bytes on token");
+                        (
+                            200u16,
+                            "OK",
+                            serde_json::json!({ "signature": sig }).to_string(),
+                        )
+                    }
+                    Err(e) => {
+                        eprintln!("gost-bridge: /__bridge/sign failed: {e}");
+                        if e.to_string().to_ascii_lowercase().contains("pin") {
+                            return Err(e);
+                        }
+                        (
+                            500u16,
+                            "Internal Server Error",
+                            serde_json::json!({ "error": e.to_string() }).to_string(),
+                        )
+                    }
+                };
+                let mut msg = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json; charset=utf-8\r\n{acao}Cache-Control: no-store\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
+                    body.len()
+                )
+                .into_bytes();
+                msg.extend_from_slice(body.as_bytes());
+                let _ = stream.write_all(&msg);
+                let _ = stream.flush();
+                continue;
+            }
+
+            // Serve our `cadesplugin` emulation in place of reference implementation's loader,
+            // and STUB its helper files in the same `/cadesplugin/` directory
+            // (`async_code.js`, `code.js`). Those run after `cadesplugin_api.js`
+            // and would replace `window.cadesplugin` with the real,
+            // extension-dependent loader (`CreateObjectAsync → pluginObject`,
+            // undefined without the browser extension), clobbering our shim.
+            // Empty stubs keep our emulation in place. (GOSREG's own code uses
+            // the standard `cadesplugin.then`/`async_spawn`/`CreateObjectAsync`
+            // surface, which the shim provides.)
+            let is_cades_api = target.contains("cadesplugin_api.js");
+            let is_cades_helper = target.contains("/cadesplugin/") && target.contains("code.js");
+            if std::env::var_os("CK_NO_SHIM").is_none() && (is_cades_api || is_cades_helper) {
+                let body: &[u8] = if is_cades_api {
+                    gost_bridge::CADESPLUGIN_SHIM_JS.as_bytes()
+                } else {
+                    b"/* CryptoKiddie: cadesplugin helper stubbed to preserve the shim */\n"
+                };
                 let mut msg = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/javascript; charset=utf-8\r\nCache-Control: no-store\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
                     body.len()
@@ -4571,7 +4780,10 @@ impl GostBridgeCommand {
                 msg.extend_from_slice(body);
                 let _ = stream.write_all(&msg);
                 let _ = stream.flush();
-                eprintln!("gost-bridge: served cadesplugin_api.js shim");
+                eprintln!(
+                    "gost-bridge: served cadesplugin {}",
+                    if is_cades_api { "shim" } else { "helper-stub" }
+                );
                 continue;
             }
 
@@ -4709,19 +4921,56 @@ impl GostBridgeCommand {
                 continue;
             }
 
-            let upstream_bytes = build_upstream_request(&req, &self.host, &jar);
+            // Universal host routing: a `/__up/<host>/<path>` target proxies to
+            // that explicit host (any `*.nalog.ru`); everything else goes to the
+            // default host. The cabinet's micro-frontends and APIs live on a
+            // sibling host (`mf-lk.nalog.ru`); `rewrite_response` rewrites their
+            // absolute URLs into the `/__up/` form, funnelling the whole cabinet
+            // through this one bridge with no per-host code.
+            let (upstream_host, origin_path) = route_upstream(&target, &self.host);
+            if upstream_host != self.host && !host_allowed(&upstream_host) {
+                eprintln!("gost-bridge: refusing non-nalog.ru host {upstream_host}");
+                let body = format!("gost-bridge: refusing to proxy host {upstream_host}");
+                let msg = format!(
+                    "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(msg.as_bytes());
+                continue;
+            }
+            req.target = origin_path;
 
-            let response = match gost_mtls_request(
-                &self.host,
-                self.port,
-                self.timeout_secs,
-                &signer,
-                &client_chain,
-                &upstream_bytes,
-            ) {
-                Ok((resp, _leaf_len)) => resp,
+            let upstream_bytes = build_upstream_request(&req, &upstream_host, &bridge_origin, &jar);
+
+            // Transport per host by NAME, not "is it the default host": only the
+            // GOST auth front (`*gost.nalog.ru`) speaks GOST TLS with the token;
+            // every other ФНС host (service.nalog.ru, mf-lk.nalog.ru, …) is
+            // ordinary TLS. This lets a bridge be launched with a plain-TLS
+            // default host (e.g. --host service.nalog.ru) without trying GOST.
+            let upstream_result = if upstream_host.ends_with("gost.nalog.ru") {
+                gost_mtls_request(
+                    &upstream_host,
+                    self.port,
+                    self.timeout_secs,
+                    &signer,
+                    &client_chain,
+                    &upstream_bytes,
+                )
+                .map(|(resp, _leaf_len)| resp)
+            } else {
+                plain_tls_request(
+                    &upstream_host,
+                    self.port,
+                    self.timeout_secs,
+                    &upstream_bytes,
+                )
+            };
+
+            let response = match upstream_result {
+                Ok(resp) => resp,
                 Err(e) => {
-                    eprintln!("gost-bridge: upstream request failed: {e}");
+                    eprintln!("gost-bridge: upstream {upstream_host} request failed: {e}");
                     let body = format!("gost-bridge upstream error: {e}");
                     let mut msg = format!(
                         "HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
@@ -4738,18 +4987,15 @@ impl GostBridgeCommand {
                 }
             };
 
-            // The cadesplugin shim makes the portal's own React SPA drive an
-            // emulated CAdESCOM object model (no browser extension):
-            // readiness passes, the store enumerates the real signer cert, and
-            // SignCades returns a placeholder. The browser then POSTs to
-            // `/api/auth/challenge`, which the bridge intercepts and re-signs on
-            // the token (see above). Default ON; set `CK_NO_SHIM` to disable.
-            let response = if std::env::var_os("CK_NO_SHIM").is_some() {
-                response
-            } else {
-                gost_bridge::inject_cadesplugin_shim(response)
-            };
-            let rewritten = rewrite_response(&response, &self.host, &bridge_origin, &mut jar);
+            // Rewrite for the browser: capture cookies, drop CSP, rewrite every
+            // absolute `*.nalog.ru` URL (incl. the config's `mf_base_url`/
+            // `api_host`) to the `/__up/` form, and inject the cadesplugin shim
+            // into HTML so the SPA's CAdESCOM signing routes to the token. The
+            // shim lets the portal's React SPA drive an emulated CAdESCOM object
+            // model (no browser extension); `SignCades` POSTs to `/__bridge/sign`
+            // and the token returns a real CMS. Set `CK_NO_SHIM` to disable.
+            let inject_shim = std::env::var_os("CK_NO_SHIM").is_none();
+            let rewritten = rewrite_response(&response, &bridge_origin, inject_shim, &mut jar);
             if let Err(e) = stream.write_all(&rewritten) {
                 eprintln!("gost-bridge: write to browser failed: {e}");
             }
@@ -5017,6 +5263,31 @@ fn extract_common_name(dn: &str) -> String {
     dn.trim().to_string()
 }
 
+/// Map an X.500 attribute OID to the short RDN key that reference implementation's CAdESCOM
+/// `SubjectName` emits, so the SPA's `CertificateObj` parser can find them:
+/// it reads the owner ФИО via `extract(SubjectName, 'SN=')` + `extract(…, 'G=')`
+/// and the display name via `'CN='`. Without these friendly keys the parser
+/// returns an empty owner and the declarant-match fails. The Russian-specific
+/// OIDs (ИНН/СНИЛС/ОГРН under `1.2.643.*`) are intentionally left as dotted
+/// OIDs — the SPA's `extractInns()` reads those directly by OID.
+fn capicom_rdn_key(key: &str) -> &str {
+    match key {
+        "2.5.4.3" => "CN",
+        "2.5.4.4" => "SN",
+        "2.5.4.42" => "G",
+        "2.5.4.12" => "T",
+        "2.5.4.10" => "O",
+        "2.5.4.11" => "OU",
+        "2.5.4.7" => "L",
+        "2.5.4.8" => "S",
+        "2.5.4.9" => "STREET",
+        "2.5.4.6" => "C",
+        "2.5.4.5" => "SERIALNUMBER",
+        "1.2.840.113549.1.9.1" => "E",
+        other => other,
+    }
+}
+
 /// Convert a `;`-separated DN (as produced by `certificate_record_from_der`)
 /// into the CAPICOM/CAdESCOM `SubjectName` form that the SPA's `reference implementation`
 /// parser expects: `KEY=VALUE` pairs joined by `, `, with values that contain
@@ -5029,7 +5300,7 @@ fn dn_to_capicom(dn: &str) -> String {
             continue;
         }
         if let Some((key, value)) = part.split_once('=') {
-            let key = key.trim();
+            let key = capicom_rdn_key(key.trim());
             let value = value.trim();
             if value.contains([',', '"', '+']) {
                 let escaped = value.replace('"', "\"\"");

@@ -166,10 +166,16 @@ impl CookieJar {
 ///
 /// Hop-by-hop and proxy-specific headers are dropped; the browser's own
 /// `Cookie` header is ignored in favour of the server-side jar.
-pub fn build_upstream_request(req: &HttpRequest, upstream_host: &str, jar: &CookieJar) -> Vec<u8> {
+pub fn build_upstream_request(
+    req: &HttpRequest,
+    upstream_host: &str,
+    bridge_origin: &str,
+    jar: &CookieJar,
+) -> Vec<u8> {
     let target = req.origin_form_target();
     let mut out = format!("{} {} HTTP/1.1\r\n", req.method, target);
     out.push_str(&format!("Host: {upstream_host}\r\n"));
+    let upstream_origin = format!("https://{upstream_host}");
 
     for (name, value) in &req.headers {
         let lname = name.to_ascii_lowercase();
@@ -180,6 +186,15 @@ pub fn build_upstream_request(req: &HttpRequest, upstream_host: &str, jar: &Cook
             // Force identity encoding so we hand the browser bytes verbatim.
             "accept-encoding" => {
                 out.push_str("Accept-Encoding: identity\r\n");
+            }
+            // The browser sees the local bridge origin, so its `Origin`/`Referer`
+            // would carry `http://127.0.0.1:...`. ФНС rejects that as a
+            // cross-origin/CSRF mismatch (HTTP 403). Rewrite them back to the
+            // real upstream origin so protected calls (the micro-frontends'
+            // data APIs, form submits) are accepted.
+            "origin" | "referer" => {
+                let fixed = value.replace(bridge_origin, &upstream_origin);
+                out.push_str(&format!("{name}: {fixed}\r\n"));
             }
             _ => {
                 out.push_str(&format!("{name}: {value}\r\n"));
@@ -238,20 +253,91 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
+/// Rewrite every absolute `*.nalog.ru` URL in `text` so it routes back through
+/// the bridge: `https://mf-lk.nalog.ru/x` → `<bridge_origin>/__up/mf-lk.nalog.ru/x`.
+/// Hosts outside `.nalog.ru` are left untouched. This is what makes the proxy
+/// *universal*: the SPA discovers every backend host from config/JS (e.g.
+/// `mf_base_url`, `api_host`), and all of them are transparently funnelled
+/// through the single bridge origin with no per-host code.
+pub fn rewrite_nalog_abs_urls(text: &str, bridge_origin: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 64);
+    let mut rest = text;
+    while let Some(pos) = rest.find("http") {
+        out.push_str(&rest[..pos]);
+        let after = &rest[pos..];
+        let scheme = if after.starts_with("https://") {
+            Some(8usize)
+        } else if after.starts_with("http://") {
+            Some(7usize)
+        } else {
+            None
+        };
+        match scheme {
+            None => {
+                out.push_str("http");
+                rest = &after[4..];
+            }
+            Some(sl) => {
+                let url_rest = &after[sl..];
+                let host_end = url_rest
+                    .find(|c: char| {
+                        !(c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == ':')
+                    })
+                    .unwrap_or(url_rest.len());
+                let hostport = &url_rest[..host_end];
+                let host = hostport.split(':').next().unwrap_or(hostport);
+                // Route each `*.nalog.ru` host through the bridge under its own
+                // `/__up/<host>/` prefix, so the request reaches that exact host
+                // (e.g. the IDP/micro-frontend backend `mf-lk.nalog.ru`) rather
+                // than the default GOST front. The path after the host is kept.
+                if host == "nalog.ru" || host.ends_with(".nalog.ru") {
+                    out.push_str(bridge_origin);
+                    out.push_str("/__up/");
+                    out.push_str(host);
+                } else {
+                    out.push_str(&after[..sl + host_end]);
+                }
+                rest = &after[sl + host_end..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Make an upstream `Set-Cookie` value safe to replay on the local http bridge
+/// origin: keep `name=value` and benign attributes, but drop `Domain` (so it
+/// binds to `127.0.0.1`), `Secure` (the bridge is plain http), and `SameSite`
+/// (avoids the `SameSite=None` requires-`Secure` rejection).
+fn sanitize_cookie_for_bridge(set_cookie: &str) -> String {
+    set_cookie
+        .split(';')
+        .map(|p| p.trim())
+        .filter(|p| {
+            let pl = p.to_ascii_lowercase();
+            !pl.starts_with("domain=") && pl != "secure" && !pl.starts_with("samesite=")
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 /// Rewrite an upstream HTTP response for the browser:
-/// - capture `Set-Cookie` pairs into `jar` and drop those headers (the jar
-///   re-injects them on subsequent upstream requests);
-/// - rewrite `Location` redirects pointing at `https://upstream_host` (or
-///   `http://upstream_host`) to the local `bridge_origin` so the browser stays
-///   on the bridge;
-/// - drop hop-by-hop headers and force `Connection: close`;
-/// - leave the body untouched.
+/// - capture `Set-Cookie` pairs into `jar` and forward a browser-safe copy;
+/// - drop hop-by-hop headers, `Content-Security-Policy` (so the proxied,
+///   shim-injected, `/__up/`-rewritten page is not blocked), and the old
+///   `Content-Length`/`Transfer-Encoding`;
+/// - de-chunk the body, and for text responses (HTML/JS/JSON/CSS/XML) rewrite
+///   every absolute `*.nalog.ru` URL to the `/__up/` form via
+///   [`rewrite_nalog_abs_urls`] — covering `Location` redirects and the
+///   micro-frontend config's `mf_base_url`/`api_host`;
+/// - inject the cadesplugin shim into HTML when `inject_shim` is set;
+/// - emit a corrected `Content-Length` and force `Connection: close`.
 ///
 /// `bridge_origin` is e.g. `http://127.0.0.1:18888`.
 pub fn rewrite_response(
     raw: &[u8],
-    upstream_host: &str,
     bridge_origin: &str,
+    inject_shim: bool,
     jar: &mut CookieJar,
 ) -> Vec<u8> {
     let parsed = match split_response(raw) {
@@ -260,10 +346,49 @@ pub fn rewrite_response(
         None => return raw.to_vec(),
     };
 
-    let https_prefix = format!("https://{upstream_host}");
-    let http_prefix = format!("http://{upstream_host}");
+    let mut content_type = String::new();
+    let mut chunked = false;
+    for line in &parsed.header_lines {
+        let lower = String::from_utf8_lossy(line).to_ascii_lowercase();
+        if lower.starts_with("content-type:") {
+            content_type = lower["content-type:".len()..].trim().to_string();
+        } else if lower.starts_with("transfer-encoding:") && lower.contains("chunked") {
+            chunked = true;
+        }
+    }
 
-    let mut out: Vec<u8> = Vec::with_capacity(raw.len());
+    let mut body = if chunked {
+        decode_chunked(parsed.body)
+    } else {
+        parsed.body.to_vec()
+    };
+
+    let is_html = content_type.contains("text/html");
+    let is_text = is_html
+        || content_type.contains("javascript")
+        || content_type.contains("json")
+        || content_type.contains("/css")
+        || content_type.contains("xml")
+        || content_type.starts_with("text/");
+    if is_text {
+        let mut s = rewrite_nalog_abs_urls(&String::from_utf8_lossy(&body), bridge_origin);
+        if is_html && inject_shim {
+            let lower = s.to_ascii_lowercase();
+            let at = lower
+                .find("<head")
+                .and_then(|i| lower[i..].find('>').map(|j| i + j + 1))
+                .or_else(|| {
+                    lower
+                        .find("<body")
+                        .and_then(|i| lower[i..].find('>').map(|j| i + j + 1))
+                })
+                .unwrap_or(0);
+            s.insert_str(at, &cadesplugin_shim_script_tag());
+        }
+        body = s.into_bytes();
+    }
+
+    let mut out: Vec<u8> = Vec::with_capacity(body.len() + 256);
     out.extend_from_slice(parsed.status_line);
     out.extend_from_slice(b"\r\n");
 
@@ -274,20 +399,30 @@ pub fn rewrite_response(
         if lower.starts_with("set-cookie:") {
             let value = text[text.find(':').map(|i| i + 1).unwrap_or(text.len())..].trim();
             jar.absorb_set_cookie(value);
-            continue; // jar handles cookies; don't forward to the browser
+            // Also forward a browser-safe copy so page JS (`document.cookie`)
+            // can read non-HttpOnly cookies. Some cabinet flows (CSRF
+            // double-submit, the IDP token exchange) read a cookie value and
+            // echo it in a request header; swallowing cookies entirely breaks
+            // them. Strip `Domain`/`Secure`/`SameSite` so the cookie sticks on
+            // the local http bridge origin. (The bridge still ignores the
+            // browser's `Cookie` header upstream in favour of the jar.)
+            out.extend_from_slice(
+                format!("Set-Cookie: {}\r\n", sanitize_cookie_for_bridge(value)).as_bytes(),
+            );
+            continue;
         }
         if lower.starts_with("connection:")
             || lower.starts_with("keep-alive:")
             || lower.starts_with("transfer-encoding:")
             || lower.starts_with("proxy-connection:")
+            || lower.starts_with("content-length:")
+            || lower.starts_with("content-security-policy")
         {
             continue;
         }
         if lower.starts_with("location:") {
             let value = text[text.find(':').map(|i| i + 1).unwrap_or(text.len())..].trim();
-            let rewritten = value
-                .replace(&https_prefix, bridge_origin)
-                .replace(&http_prefix, bridge_origin);
+            let rewritten = rewrite_nalog_abs_urls(value, bridge_origin);
             out.extend_from_slice(format!("Location: {rewritten}\r\n").as_bytes());
             continue;
         }
@@ -295,9 +430,9 @@ pub fn rewrite_response(
         out.extend_from_slice(b"\r\n");
     }
 
-    out.extend_from_slice(b"Connection: close\r\n");
-    out.extend_from_slice(b"\r\n");
-    out.extend_from_slice(parsed.body);
+    out.extend_from_slice(format!("Content-Length: {}\r\n", body.len()).as_bytes());
+    out.extend_from_slice(b"Connection: close\r\n\r\n");
+    out.extend_from_slice(&body);
     out
 }
 
@@ -483,6 +618,15 @@ pub fn parse_multipart_fields(body: &[u8], boundary: &str) -> Vec<(String, Vec<u
 /// `cadesplugin_api.js` (so the real extension loader never clobbers it).
 pub const CADESPLUGIN_SHIM_JS: &str = r##"(function(){
 if(window.__ckCadesShim)return;window.__ckCadesShim=true;
+// Diagnostic: record failing fetch/XHR (status>=400 or network error) so the
+// operator can see which cabinet API call fails through the bridge.
+try{window.__ckXhrLog=[];var _of=window.fetch;
+window.fetch=function(u,init){var url=(typeof u==='string')?u:(u&&u.url)||'';
+return _of.apply(this,arguments).then(function(r){if(!r.ok&&window.__ckXhrLog.length<60){var rb=(init&&init.body)?String(init.body).slice(0,160):'';r.clone().text().then(function(t){window.__ckXhrLog.push(r.status+' '+url+' | REQ='+rb+' | RESP='+t.slice(0,260));}).catch(function(){window.__ckXhrLog.push(r.status+' '+url);});}return r;})
+.catch(function(e){if(window.__ckXhrLog.length<60)window.__ckXhrLog.push('ERR '+url+' '+(e&&e.message||e));throw e;});};
+var _ox=XMLHttpRequest.prototype.open,_os=XMLHttpRequest.prototype.send;
+XMLHttpRequest.prototype.open=function(m,u){this.__cku=m+' '+u;return _ox.apply(this,arguments);};
+XMLHttpRequest.prototype.send=function(){var x=this;x.addEventListener('loadend',function(){if((x.status===0||x.status>=400)&&window.__ckXhrLog.length<60)window.__ckXhrLog.push(x.status+' '+x.__cku);});return _os.apply(this,arguments);};}catch(e){}
 function P(v){return Promise.resolve(v);}
 var CI=null;
 function def(){return {thumbprint:'0000000000000000000000000000000000000000',certB64:'',subject:'CN=Rutoken',issuer:'CN=CA',serialNumber:'00',notBefore:1577836800,notAfter:4102444800,subjectCN:'Rutoken'};}
@@ -511,9 +655,17 @@ function mkHashed(){var v='';return {propset_Algorithm:function(){return P(undef
 propset_DataEncoding:function(){return P(undefined);},SetHashValue:function(h){v=h;return P(undefined);},
 Hash:function(){return P(undefined);},Value:v};}
 var PLACEHOLDER='Q3J5cHRvS2lkZGllLWJyaWRnZS1yZXNpZ25zLXRoaXMtc2VydmVyLXNpZGU=';
-function mkSigned(){return {propset_ContentEncoding:function(){return P(undefined);},
-propset_Content:function(){return P(undefined);},propset_Certificate:function(){return P(undefined);},
-SignCades:function(){return P(PLACEHOLDER);},SignHash:function(){return P(PLACEHOLDER);},Sign:function(){return P(PLACEHOLDER);}};}
+function postSign(content,enc){
+return fetch('/__bridge/sign',{method:'POST',cache:'no-store',headers:{'Content-Type':'application/json'},
+body:JSON.stringify({content:String(content==null?'':content),encoding:enc})})
+.then(function(r){return r.json();}).then(function(j){if(j&&j.signature){return j.signature;}
+throw new Error('bridge sign failed: '+((j&&j.error)||'unknown'));});}
+function mkSigned(){var _c='',_e='base64';
+return {propset_ContentEncoding:function(v){_e=(v===0||v==='0')?'ucs2le':'base64';return P(undefined);},
+propset_Content:function(v){_c=(v==null?'':String(v));return P(undefined);},propset_Certificate:function(){return P(undefined);},
+SignCades:function(){window.__ckLastSign={method:'SignCades',enc:_e,len:_c.length};return postSign(_c,_e);},
+SignHash:function(){window.__ckLastSign={method:'SignHash',enc:_e,len:_c.length};return postSign(_c,_e);},
+Sign:function(){window.__ckLastSign={method:'Sign',enc:_e,len:_c.length};return postSign(_c,_e);}};}
 function makeAsync(progId){progId=String(progId||'');
 if(progId.indexOf('Store')>=0){return certInfo().then(function(info){return mkStore([mkCert(info)]);});}
 if(progId.indexOf('About')>=0){return P(mkAbout());}
@@ -536,9 +688,18 @@ XmlDsigGost3410Url2012256:'urn:ietf:params:xml:ns:cpxmlsec:algorithms:gostr34102
 XmlDsigGost3411Url2012256:'urn:ietf:params:xml:ns:cpxmlsec:algorithms:gostr34112012-256',
 LOG_LEVEL_DEBUG:4,LOG_LEVEL_INFO:2,LOG_LEVEL_ERROR:1};
 var cp={set_log_level:function(){},set:function(){},getLastError:function(){return '';},
-CreateObjectAsync:function(p){return makeAsync(p);},CreateObject:function(){return {};}};
+CreateObjectAsync:function(p){return makeAsync(p);},CreateObject:function(){return {};},
+then:function(onR,onJ){try{if(onR)onR();}catch(e){if(onJ)onJ(e);}return P();},
+async_spawn:function(gen,arg){var it=gen.call(null,arg);
+function step(m,v){var r;try{r=it[m](v);}catch(e){return Promise.reject(e);}
+if(r.done)return Promise.resolve(r.value);
+return Promise.resolve(r.value).then(function(x){return step('next',x);},function(e){return step('throw',e);});}
+return step('next');}};
 for(var k in consts){cp[k]=consts[k];}
-try{window.cadesplugin=cp;}catch(e){}
+// Lock it down so reference implementation's real loader (which may arrive via an absolute
+// URL bypassing the bridge) cannot replace our emulation with its
+// extension-dependent `pluginObject` (undefined here).
+try{Object.defineProperty(window,'cadesplugin',{value:cp,writable:false,configurable:false,enumerable:true});}catch(e){try{window.cadesplugin=cp;}catch(_){}}
 try{window.cadesplugin_load_error=false;}catch(e){}
 console.log('[CryptoKiddie] cadesplugin emulation installed (no extension)');
 })();"##;
@@ -674,7 +835,8 @@ mod tests {
         };
         let mut jar = CookieJar::new();
         jar.absorb_set_cookie("PHPSESSID=sess; path=/");
-        let bytes = build_upstream_request(&req, "lkulgost.nalog.ru", &jar);
+        let bytes =
+            build_upstream_request(&req, "lkulgost.nalog.ru", "http://127.0.0.1:18888", &jar);
         let text = String::from_utf8(bytes).unwrap();
         assert!(text.starts_with("GET / HTTP/1.1\r\n"));
         assert!(text.contains("Host: lkulgost.nalog.ru\r\n"));
@@ -695,10 +857,12 @@ mod tests {
             Content-Length: 0\r\n\
             \r\n";
         let mut jar = CookieJar::new();
-        let out = rewrite_response(raw, "lkulgost.nalog.ru", "http://127.0.0.1:18888", &mut jar);
+        let out = rewrite_response(raw, "http://127.0.0.1:18888", false, &mut jar);
         let text = String::from_utf8(out).unwrap();
-        assert!(text.contains("Location: http://127.0.0.1:18888/v2/auth\r\n"));
-        assert!(!text.to_ascii_lowercase().contains("set-cookie")); // stripped
+        assert!(
+            text.contains("Location: http://127.0.0.1:18888/__up/lkulgost.nalog.ru/v2/auth\r\n")
+        );
+        assert!(text.contains("Set-Cookie: PHPSESSID=zzz; path=/\r\n")); // sanitized copy forwarded
         assert!(text.contains("Server: Apache\r\n"));
         assert_eq!(jar.header_value().as_deref(), Some("PHPSESSID=zzz"));
     }
@@ -707,7 +871,7 @@ mod tests {
     fn rewrite_preserves_body() {
         let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
         let mut jar = CookieJar::new();
-        let out = rewrite_response(raw, "lkulgost.nalog.ru", "http://127.0.0.1:1", &mut jar);
+        let out = rewrite_response(raw, "http://127.0.0.1:1", false, &mut jar);
         let text = String::from_utf8(out).unwrap();
         assert!(text.ends_with("\r\n\r\nhello"));
     }
