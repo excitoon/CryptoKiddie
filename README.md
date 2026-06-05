@@ -1,8 +1,18 @@
 # CryptoKiddie
 
+*Reach Russian government services (ФНС, госуслуги) from OS X and Linux with a hardware token — no proprietary, Windows-only crypto software in the way.*
+
 Minimal native Rust CLI for building a self-contained document-signing path around token-backed cryptographic keys without an OpenSSL dependency.
 
 The project name is currently `CryptoKiddie`; `CryptoKittie` is also under consideration as an alternate name.
+
+## Why
+
+Russia's government services — the tax service (ФНС), госуслуги, and more — require a qualified electronic signature (УКЭП) over GOST TLS, and in practice that has meant one proprietary, Windows-first stack plus a fragile browser plugin. OS X and Linux are shut out; even on Windows it's paid licenses, install rituals, and a plugin that breaks on update.
+
+CryptoKiddie is an independent, from-scratch, cross-platform implementation of the parts that matter — `ГОСТ Р 34.10-2012` TLS 1.2 mutual auth, Streebog, VKO, CAdES-BES — plus a local bridge that speaks the browser `cadesplugin` interface and signs through a hardware token. The goal is simple: reach these services from the OS you already run, with your own token, without the bad software in the way.
+
+It implements published GOST standards and is not affiliated with, endorsed by, or certified by any vendor or authority. Provided as-is, without warranty (see `LICENSE.md`).
 
 ## Direction
 
