@@ -701,6 +701,13 @@ for(var k in consts){cp[k]=consts[k];}
 // extension-dependent `pluginObject` (undefined here).
 try{Object.defineProperty(window,'cadesplugin',{value:cp,writable:false,configurable:false,enumerable:true});}catch(e){try{window.cadesplugin=cp;}catch(_){}}
 try{window.cadesplugin_load_error=false;}catch(e){}
+// Legacy/NPAPI load handshake: some ФНС pages (e.g. НБО's `bfd` watchdog) post
+// `cadesplugin_echo_request` and wait for `cadesplugin_loaded`, otherwise timing
+// out with "Истекло время ожидания загрузки плагина" and blocking cert auth. The
+// real loader both answers the echo and broadcasts on load — mirror both so that
+// detection path succeeds (the Promise/`then` path is already covered above).
+try{window.addEventListener('message',function(e){if(e&&e.data==='cadesplugin_echo_request'){try{window.postMessage('cadesplugin_loaded','*');}catch(_){}}},false);}catch(e){}
+try{window.postMessage('cadesplugin_loaded','*');}catch(e){}
 console.log('[CryptoKiddie] cadesplugin emulation installed (no extension)');
 })();"##;
 

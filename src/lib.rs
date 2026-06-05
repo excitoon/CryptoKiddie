@@ -4755,23 +4755,18 @@ impl GostBridgeCommand {
                 continue;
             }
 
-            // Serve our `cadesplugin` emulation in place of reference implementation's loader,
-            // and STUB its helper files in the same `/cadesplugin/` directory
-            // (`async_code.js`, `code.js`). Those run after `cadesplugin_api.js`
-            // and would replace `window.cadesplugin` with the real,
-            // extension-dependent loader (`CreateObjectAsync → pluginObject`,
-            // undefined without the browser extension), clobbering our shim.
-            // Empty stubs keep our emulation in place. (GOSREG's own code uses
-            // the standard `cadesplugin.then`/`async_spawn`/`CreateObjectAsync`
-            // surface, which the shim provides.)
+            // Serve our `cadesplugin` emulation in place of the reference
+            // implementation's loader (`cadesplugin_api.js`). The shim LOCKS
+            // `window.cadesplugin` (non-configurable), so the sample helper file
+            // `code.js` can no longer clobber it — therefore we let `code.js`
+            // PROXY THROUGH instead of stubbing it. ФНС НБО's sign-in calls
+            // `Common_CheckForPlugIn`/`FillCertList`/`Common_SignCadesBES`/
+            // `CertificateObj` from that file directly; stubbing left them
+            // undefined and broke НБО auth. They drive the `cadesplugin.*`
+            // surface the shim provides.
             let is_cades_api = target.contains("cadesplugin_api.js");
-            let is_cades_helper = target.contains("/cadesplugin/") && target.contains("code.js");
-            if std::env::var_os("CK_NO_SHIM").is_none() && (is_cades_api || is_cades_helper) {
-                let body: &[u8] = if is_cades_api {
-                    gost_bridge::CADESPLUGIN_SHIM_JS.as_bytes()
-                } else {
-                    b"/* CryptoKiddie: cadesplugin helper stubbed to preserve the shim */\n"
-                };
+            if std::env::var_os("CK_NO_SHIM").is_none() && is_cades_api {
+                let body: &[u8] = gost_bridge::CADESPLUGIN_SHIM_JS.as_bytes();
                 let mut msg = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/javascript; charset=utf-8\r\nCache-Control: no-store\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
                     body.len()
@@ -4780,10 +4775,7 @@ impl GostBridgeCommand {
                 msg.extend_from_slice(body);
                 let _ = stream.write_all(&msg);
                 let _ = stream.flush();
-                eprintln!(
-                    "gost-bridge: served cadesplugin {}",
-                    if is_cades_api { "shim" } else { "helper-stub" }
-                );
+                eprintln!("gost-bridge: served cadesplugin shim");
                 continue;
             }
 
