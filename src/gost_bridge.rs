@@ -374,7 +374,12 @@ pub fn rewrite_response(
         let mut s = rewrite_nalog_abs_urls(&String::from_utf8_lossy(&body), bridge_origin);
         if is_html && inject_shim {
             let lower = s.to_ascii_lowercase();
-            let at = lower
+            // Only inject into a real HTML document (one with <head>/<body>). Some
+            // ФНС ExtJS endpoints return JSON (e.g. grid data `{"root":[],...}`)
+            // labeled `Content-Type: text/html`; prepending a <script> there
+            // corrupts the JSON and breaks the cabinet's data loads. If neither
+            // <head> nor <body> is present, leave the body untouched.
+            if let Some(at) = lower
                 .find("<head")
                 .and_then(|i| lower[i..].find('>').map(|j| i + j + 1))
                 .or_else(|| {
@@ -382,8 +387,9 @@ pub fn rewrite_response(
                         .find("<body")
                         .and_then(|i| lower[i..].find('>').map(|j| i + j + 1))
                 })
-                .unwrap_or(0);
-            s.insert_str(at, &cadesplugin_shim_script_tag());
+            {
+                s.insert_str(at, &cadesplugin_shim_script_tag());
+            }
         }
         body = s.into_bytes();
     }
@@ -690,7 +696,7 @@ LOG_LEVEL_DEBUG:4,LOG_LEVEL_INFO:2,LOG_LEVEL_ERROR:1};
 var cp={set_log_level:function(){},set:function(){},getLastError:function(){return '';},
 CreateObjectAsync:function(p){return makeAsync(p);},CreateObject:function(){return {};},
 then:function(onR,onJ){try{if(onR)onR();}catch(e){if(onJ)onJ(e);}return P();},
-async_spawn:function(gen,arg){var it=gen.call(null,arg);
+async_spawn:function(gen){var args=Array.prototype.slice.call(arguments,1);var it=gen.call(null,args);
 function step(m,v){var r;try{r=it[m](v);}catch(e){return Promise.reject(e);}
 if(r.done)return Promise.resolve(r.value);
 return Promise.resolve(r.value).then(function(x){return step('next',x);},function(e){return step('throw',e);});}
@@ -708,6 +714,15 @@ try{window.cadesplugin_load_error=false;}catch(e){}
 // detection path succeeds (the Promise/`then` path is already covered above).
 try{window.addEventListener('message',function(e){if(e&&e.data==='cadesplugin_echo_request'){try{window.postMessage('cadesplugin_loaded','*');}catch(_){}}},false);}catch(e){}
 try{window.postMessage('cadesplugin_loaded','*');}catch(e){}
+// ФНС ЛКЮЛ legacy /docflow readiness-race fix: through the bridge every script
+// load is a slow token handshake, so the cabinet's crypto driver finishes after
+// `LkUl.Signature.init`'s 1.5s timer and `LkUl.Signature.cryptoapi.loading` is
+// left undefined; the document view's `toggleSignatureReady` poll then waits
+// forever on "Ожидание готовности плагина" even though signing is actually ready
+// (pluginEnabled=true, cert list populated). Once the plugin and cert list are
+// genuinely ready, flip `loading` to false so the still-running poll completes.
+// Guarded so it never trips the "plugin not ready" failure branch.
+try{(function(){var n=0;var iv=setInterval(function(){n++;if(n>360){clearInterval(iv);return;}try{if(typeof LkUl==='undefined'||!LkUl.Signature)return;var c=LkUl.Signature.cryptoapi;if(c&&c.pluginEnabled&&c.certificateList&&c.certificateList.length>0&&c.loading!==false){c.loading=false;}}catch(e){}},500);})();}catch(e){}
 console.log('[CryptoKiddie] cadesplugin emulation installed (no extension)');
 })();"##;
 

@@ -3110,6 +3110,10 @@ where
             let command = CcidProbeCommand::parse(args)?;
             command.run()
         }
+        Some(command) if command == "ccid-apdu" => {
+            let command = CcidApduCommand::parse(args)?;
+            command.run()
+        }
         Some(command) if command == "ccid-sign-raw" => {
             let command = CcidRawSignCommand::parse(args)?;
             command.run()
@@ -3709,6 +3713,109 @@ impl CcidProbeCommand {
     }
 }
 
+/// Diagnostic: send raw APDUs to the token and print each response (SW + data).
+/// Used to walk a token's real PKCS#15 directory when the fixed cert-scan paths
+/// miss the certificate (e.g. a Контур-issued Rutoken whose Cer-DF isn't 6004).
+pub struct CcidApduCommand {
+    pub ccid_reader: Option<String>,
+    pub exchange_log: Option<PathBuf>,
+    pub pin_env: Option<String>,
+    pub apdus: Vec<String>,
+}
+
+impl CcidApduCommand {
+    fn parse<I>(args: I) -> Result<Self, CliError>
+    where
+        I: IntoIterator<Item = OsString>,
+    {
+        let mut ccid_reader = None;
+        let mut exchange_log = None;
+        let mut pin_env = None;
+        let mut apdus = Vec::new();
+        let mut iter = args.into_iter();
+        while let Some(arg) = iter.next() {
+            match arg.to_string_lossy().as_ref() {
+                "--ccid-reader" => {
+                    ccid_reader =
+                        Some(next_value(&mut iter, "--ccid-reader")?.to_string_lossy().into())
+                }
+                "--exchange-log" => {
+                    exchange_log = Some(PathBuf::from(next_value(&mut iter, "--exchange-log")?))
+                }
+                "--pin-env" => {
+                    pin_env = Some(next_value(&mut iter, "--pin-env")?.to_string_lossy().into_owned())
+                }
+                "--apdu" => {
+                    apdus.push(next_value(&mut iter, "--apdu")?.to_string_lossy().into_owned())
+                }
+                other => return Err(CliError::Usage(format!("unknown option: {other}"))),
+            }
+        }
+        Ok(Self {
+            ccid_reader,
+            exchange_log,
+            pin_env,
+            apdus,
+        })
+    }
+
+    pub fn run(&self) -> Result<String, CliError> {
+        let mut device = ccid::CcidDevice::open_with_exchange_log(
+            self.ccid_reader.as_deref(),
+            self.exchange_log.as_deref(),
+        )?;
+        let atr = device.power_on()?;
+        let mut lines = vec![format!("atr_hex={}", hex_encode(&atr))];
+        if let Some(env) = &self.pin_env {
+            let pin = std::env::var(env)
+                .map_err(|_| CliError::Message(format!("PIN env var {env} not set")))?;
+            let _ = device.transmit(&rutoken::select_master_file())?;
+            let mut resp = device.transmit(&rutoken::verify_pin(pin.as_bytes()))?;
+            if resp.sw1 == 0x6F && resp.sw2 == 0x86 {
+                let _ = device.transmit(&rutoken::logout())?;
+                resp = device.transmit(&rutoken::verify_pin(pin.as_bytes()))?;
+            }
+            lines.push(format!("verify_pin_sw={:02x}{:02x}", resp.sw1, resp.sw2));
+        }
+        for h in &self.apdus {
+            let clean: String = h.chars().filter(|c| !c.is_whitespace()).collect();
+            if clean.len() % 2 != 0 {
+                return Err(CliError::Message(format!("odd-length apdu hex: {h}")));
+            }
+            let raw = (0..clean.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&clean[i..i + 2], 16))
+                .collect::<Result<Vec<u8>, _>>()
+                .map_err(|e| CliError::Message(format!("bad apdu hex {h}: {e}")))?;
+            if raw.len() < 4 {
+                return Err(CliError::Message(format!("apdu too short: {h}")));
+            }
+            let mut cmd = apdu::CommandApdu::new(raw[0], raw[1], raw[2], raw[3]);
+            if raw.len() == 5 {
+                cmd = cmd.with_le(raw[4]);
+            } else if raw.len() > 5 {
+                let lc = raw[4] as usize;
+                let data_end = 5 + lc;
+                if data_end <= raw.len() {
+                    cmd = cmd.with_data(raw[5..data_end].to_vec());
+                    if raw.len() == data_end + 1 {
+                        cmd = cmd.with_le(raw[data_end]);
+                    }
+                }
+            }
+            let resp = device.transmit(&cmd)?;
+            lines.push(format!(
+                "> {h}\n< sw={:02x}{:02x} len={} data={}",
+                resp.sw1,
+                resp.sw2,
+                resp.data.len(),
+                hex_encode(&resp.data)
+            ));
+        }
+        Ok(lines.join("\n"))
+    }
+}
+
 impl CcidRawSignCommand {
     fn parse<I>(args: I) -> Result<Self, CliError>
     where
@@ -4247,13 +4354,87 @@ fn host_allowed(host: &str) -> bool {
     h == "nalog.ru" || h.ends_with(".nalog.ru")
 }
 
+/// A ФНС "GOST front" is a `*.nalog.ru` host whose leftmost label contains
+/// `gost` (e.g. `lkulgost.nalog.ru` for ЛКЮЛ, `lkipgost2.nalog.ru` for ЛК ИП).
+/// Only these speak GOST TLS with the token; every other ФНС host
+/// (`service.nalog.ru`, `mf-lk.nalog.ru`, `lkip2.nalog.ru`, …) is ordinary TLS.
+///
+/// Matching by label rather than `ends_with("gost.nalog.ru")` is deliberate:
+/// the ИП front is `lkipgost2.nalog.ru`, which ends with `gost2.nalog.ru`, so a
+/// plain suffix test would misroute it to plain TLS and the handshake would fail.
+fn is_gost_front(host: &str) -> bool {
+    let h = host.split(':').next().unwrap_or(host);
+    h.ends_with(".nalog.ru") && h.split('.').next().is_some_and(|label| label.contains("gost"))
+}
+
+/// Load a client certificate chain from `path`, leaf first.
+///
+/// A single DER file yields a one-element chain (the historical behaviour). A
+/// PEM file is parsed into one DER entry per `CERTIFICATE` block, in file order
+/// — so a `leaf + intermediate(s)` bundle is sent as a proper TLS certificate
+/// chain. This is needed for leafs issued by a commercial УЦ (e.g. СКБ Контур
+/// for ЛК ИП): the GOST front (`lkipgost2.nalog.ru`) rejects a leaf-only message
+/// with `unknown_ca`, whereas a ФНС-issued leaf (ЛКЮЛ) validates on its own.
+fn load_client_cert_chain(path: &std::path::Path) -> Result<Vec<Vec<u8>>, CliError> {
+    use base64::Engine as _;
+    let bytes = fs::read(path)
+        .map_err(|e| CliError::Message(format!("read client cert {}: {e}", path.display())))?;
+    let is_pem = std::str::from_utf8(&bytes)
+        .map(|t| t.contains("-----BEGIN CERTIFICATE-----"))
+        .unwrap_or(false);
+    if !is_pem {
+        return Ok(vec![bytes]);
+    }
+    const BEGIN: &str = "-----BEGIN CERTIFICATE-----";
+    const END: &str = "-----END CERTIFICATE-----";
+    let text = String::from_utf8_lossy(&bytes);
+    let mut chain = Vec::new();
+    let mut rest = text.as_ref();
+    while let Some(start) = rest.find(BEGIN) {
+        let after = &rest[start + BEGIN.len()..];
+        let Some(end) = after.find(END) else { break };
+        let b64: String = after[..end].chars().filter(|c| !c.is_whitespace()).collect();
+        let der = base64::engine::general_purpose::STANDARD
+            .decode(b64.as_bytes())
+            .map_err(|e| {
+                CliError::Message(format!("client cert {}: bad base64 in PEM: {e}", path.display()))
+            })?;
+        chain.push(der);
+        rest = &after[end + END.len()..];
+    }
+    if chain.is_empty() {
+        return Err(CliError::Message(format!(
+            "client cert {}: no CERTIFICATE blocks found",
+            path.display()
+        )));
+    }
+    Ok(chain)
+}
+
 /// Origins permitted to invoke the token-signing oracle (`/__bridge/sign`,
 /// `/__bridge/cert-info`): the ФНС registration page (when the shim is injected
 /// into the natively-loaded `service.nalog.ru` page), the bridge's own origin
 /// (proxy / same-origin case), or no `Origin` at all (local curl). Everything
 /// else is refused, so a foreign web page cannot drive the УКЭП.
 fn sign_origin_allowed(origin: &str, bridge_origin: &str) -> bool {
-    origin.is_empty() || origin == "https://service.nalog.ru" || origin == bridge_origin
+    if origin.is_empty() || origin == bridge_origin {
+        return true;
+    }
+    // Confine the УКЭП oracle to ФНС pages: any https origin whose host is a
+    // nalog.ru or nalog.gov.ru host — the legacy cabinets (service.nalog.ru,
+    // *.nalog.ru) and the new unified ЕЛК (elk.nalog.gov.ru). A foreign page's
+    // browser-set Origin won't match, so it still cannot drive the token.
+    match origin.strip_prefix("https://") {
+        Some(rest) => {
+            let host = rest.split('/').next().unwrap_or(rest);
+            let host = host.split(':').next().unwrap_or(host);
+            host == "nalog.ru"
+                || host.ends_with(".nalog.ru")
+                || host == "nalog.gov.ru"
+                || host.ends_with(".nalog.gov.ru")
+        }
+        None => false,
+    }
 }
 
 /// `Access-Control-Allow-Origin` header line echoing an allowed `Origin`, or
@@ -4455,15 +4636,12 @@ impl GostLoginCommand {
             self.exchange_log.clone(),
         );
 
-        // Client certificate chain (leaf): from a file if given, else read off
-        // the token.
-        let client_leaf = match &self.client_cert {
-            Some(path) => fs::read(path).map_err(|e| {
-                CliError::Message(format!("read client cert {}: {e}", path.display()))
-            })?,
-            None => token::read_certificate_der(&signer)?,
+        // Client certificate chain: from a file if given (DER leaf, or a PEM
+        // leaf+intermediate bundle), else read the leaf off the token.
+        let client_chain = match &self.client_cert {
+            Some(path) => load_client_cert_chain(path)?,
+            None => vec![token::read_certificate_der(&signer)?],
         };
-        let client_chain = vec![client_leaf];
 
         // Send a minimal HTTP/1.1 GET over the established channel.
         let request = format!(
@@ -4584,15 +4762,13 @@ impl GostBridgeCommand {
             self.exchange_log.clone(),
         );
 
-        // Load the client leaf certificate once (from a file, or the token) so
-        // the per-request handshakes reuse it.
-        let client_leaf = match &self.client_cert {
-            Some(path) => fs::read(path).map_err(|e| {
-                CliError::Message(format!("read client cert {}: {e}", path.display()))
-            })?,
-            None => token::read_certificate_der(&signer)?,
+        // Load the client certificate chain once (from a file — DER leaf, or a
+        // PEM leaf+intermediate bundle — or the token's leaf) so the per-request
+        // handshakes reuse it.
+        let client_chain = match &self.client_cert {
+            Some(path) => load_client_cert_chain(path)?,
+            None => vec![token::read_certificate_der(&signer)?],
         };
-        let client_chain = vec![client_leaf];
 
         let listener = TcpListener::bind(&self.bind)
             .map_err(|e| CliError::Message(format!("bind {}: {e}", self.bind)))?;
@@ -4940,7 +5116,7 @@ impl GostBridgeCommand {
             // every other ФНС host (service.nalog.ru, mf-lk.nalog.ru, …) is
             // ordinary TLS. This lets a bridge be launched with a plain-TLS
             // default host (e.g. --host service.nalog.ru) without trying GOST.
-            let upstream_result = if upstream_host.ends_with("gost.nalog.ru") {
+            let upstream_result = if is_gost_front(&upstream_host) {
                 gost_mtls_request(
                     &upstream_host,
                     self.port,
