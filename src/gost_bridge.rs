@@ -305,6 +305,38 @@ pub fn rewrite_nalog_abs_urls(text: &str, bridge_origin: &str) -> String {
     out
 }
 
+/// Pin a proxied non-primary host's root-relative URLs to its `/__up/<host>/`
+/// prefix. A page fetched from `/__up/service.nalog.ru/gosreg/doc-sign.html`
+/// carries root-relative refs like `src="/static/js/cadesplugin/code.js"`; left
+/// alone the browser resolves them against the bridge origin and routes them to
+/// the PRIMARY GOST front (302/404), so the gosreg cryptoapi wrapper never loads.
+/// Rewrites `"/seg…`, `'/seg…`, `(/seg…` where the path segment starts
+/// alphanumeric — which excludes protocol-relative `//` and the already-rewritten
+/// `/__up/`. The delimiters and `/` are ASCII, so the byte scan is UTF-8-safe.
+fn rewrite_root_relative_urls(text: &str, host: &str) -> String {
+    let prefix = format!("/__up/{host}");
+    let mut out = String::with_capacity(text.len() + 128);
+    let bytes = text.as_bytes();
+    let mut last = 0usize;
+    let mut i = 0usize;
+    while i + 2 < bytes.len() {
+        let c = bytes[i];
+        if (c == b'"' || c == b'\'' || c == b'(')
+            && bytes[i + 1] == b'/'
+            && bytes[i + 2].is_ascii_alphanumeric()
+        {
+            out.push_str(&text[last..=i]); // text up to and including the delimiter
+            out.push_str(&prefix);
+            last = i + 1; // resume at the '/', which keeps its leading slash
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    out.push_str(&text[last..]);
+    out
+}
+
 /// Make an upstream `Set-Cookie` value safe to replay on the local http bridge
 /// origin: keep `name=value` and benign attributes, but drop `Domain` (so it
 /// binds to `127.0.0.1`), `Secure` (the bridge is plain http), and `SameSite`
@@ -337,6 +369,8 @@ fn sanitize_cookie_for_bridge(set_cookie: &str) -> String {
 pub fn rewrite_response(
     raw: &[u8],
     bridge_origin: &str,
+    upstream_host: &str,
+    primary_host: &str,
     inject_shim: bool,
     jar: &mut CookieJar,
 ) -> Vec<u8> {
@@ -372,6 +406,14 @@ pub fn rewrite_response(
         || content_type.starts_with("text/");
     if is_text {
         let mut s = rewrite_nalog_abs_urls(&String::from_utf8_lossy(&body), bridge_origin);
+        // A proxied non-primary host's root-relative refs (`/static/…`,
+        // `/gosreg/…`) would otherwise resolve against the bridge origin and route
+        // to the PRIMARY GOST front (302/404) — e.g. the gosreg cryptoapi
+        // `code.js` never loads and the whole doc-sign UI fails to build. Pin
+        // them to this host's own `/__up/<host>/` prefix.
+        if is_html && upstream_host != primary_host {
+            s = rewrite_root_relative_urls(&s, upstream_host);
+        }
         if is_html && inject_shim {
             let lower = s.to_ascii_lowercase();
             // Only inject into a real HTML document (one with <head>/<body>). Some
@@ -624,8 +666,13 @@ pub fn parse_multipart_fields(body: &[u8], boundary: &str) -> Vec<(String, Vec<u
 /// `cadesplugin_api.js` (so the real extension loader never clobbers it).
 pub const CADESPLUGIN_SHIM_JS: &str = r##"(function(){
 if(window.__ckCadesShim)return;window.__ckCadesShim=true;
+// Diagnostic: capture uncaught JS errors + promise rejections (the page's crypto
+// flow can throw synchronously before any XHR), so the operator can see the exact
+// failing cadesplugin call.
+window.__ckErr=[];window.__ckTrace=[];try{window.addEventListener('error',function(e){window.__ckErr.push('ERR: '+(e.message||'')+' @'+String(e.filename||'').split('/').pop()+':'+(e.lineno||'')+((e.error&&e.error.stack)?' | '+String(e.error.stack).split('\n').slice(0,4).join(' <- '):''));},true);window.addEventListener('unhandledrejection',function(e){var r=e.reason;window.__ckErr.push('REJ: '+((r&&(r.message||''))||String(r))+((r&&r.stack)?' | '+String(r.stack).split('\n').slice(0,4).join(' <- '):''));},true);}catch(_e){}
 // Diagnostic: record failing fetch/XHR (status>=400 or network error) so the
 // operator can see which cabinet API call fails through the bridge.
+try{var _pm=window.postMessage;window.postMessage=function(m){try{if(window.__ckTrace)window.__ckTrace.push('PM:'+(typeof m==='string'?m:JSON.stringify(m)).slice(0,90));}catch(_p){}return _pm.apply(this,arguments);};}catch(_pe){}
 try{window.__ckXhrLog=[];var _of=window.fetch;
 window.fetch=function(u,init){var url=(typeof u==='string')?u:(u&&u.url)||'';
 return _of.apply(this,arguments).then(function(r){if(!r.ok&&window.__ckXhrLog.length<60){var rb=(init&&init.body)?String(init.body).slice(0,160):'';r.clone().text().then(function(t){window.__ckXhrLog.push(r.status+' '+url+' | REQ='+rb+' | RESP='+t.slice(0,260));}).catch(function(){window.__ckXhrLog.push(r.status+' '+url);});}return r;})
@@ -694,8 +741,8 @@ XmlDsigGost3410Url2012256:'urn:ietf:params:xml:ns:cpxmlsec:algorithms:gostr34102
 XmlDsigGost3411Url2012256:'urn:ietf:params:xml:ns:cpxmlsec:algorithms:gostr34112012-256',
 LOG_LEVEL_DEBUG:4,LOG_LEVEL_INFO:2,LOG_LEVEL_ERROR:1};
 var cp={set_log_level:function(){},set:function(){},getLastError:function(){return '';},
-CreateObjectAsync:function(p){return makeAsync(p);},CreateObject:function(){return {};},
-then:function(onR,onJ){try{if(onR)onR();}catch(e){if(onJ)onJ(e);}return P();},
+CreateObjectAsync:function(p){window.__ckTrace&&window.__ckTrace.push('COA('+p+')');return makeAsync(p).then(function(obj){try{if(obj&&typeof obj==='object'){for(var kk in obj){(function(k){var orig=obj[k];if(typeof orig==='function'){obj[k]=function(){window.__ckTrace&&window.__ckTrace.push(p+'.'+k);try{var rv=orig.apply(obj,arguments);if(rv&&typeof rv.then==='function'){return rv.then(function(x){return x;},function(e){window.__ckErr.push('AWAIT '+p+'.'+k+': '+(e&&e.message||e));throw e;});}return rv;}catch(e){window.__ckErr.push('SYNC '+p+'.'+k+': '+(e&&e.message||e));throw e;}};}})(kk);}}}catch(_w){}return obj;});},CreateObject:function(pp){window.__ckTrace&&window.__ckTrace.push('CreateObject('+pp+')');return makeAsync(pp);},
+then:function(onR,onJ){window.__ckTrace&&window.__ckTrace.push('cadesplugin.then');try{var rv=onR?onR():undefined;if(rv&&typeof rv.then==='function'){rv.then(null,function(e){window.__ckErr&&window.__ckErr.push('then-onR ASYNC-THREW: '+(e&&e.message||String(e))+((e&&e.stack)?' | '+String(e.stack).split('\n').slice(0,6).join(' <- '):''));});}}catch(e){window.__ckErr&&window.__ckErr.push('then-onR SYNC-THREW: '+(e&&e.message||String(e))+((e&&e.stack)?' | '+String(e.stack).split('\n').slice(0,6).join(' <- '):''));if(onJ)onJ(e);}return P();},
 async_spawn:function(gen){var args=Array.prototype.slice.call(arguments,1);var it=gen.call(null,args);
 function step(m,v){var r;try{r=it[m](v);}catch(e){return Promise.reject(e);}
 if(r.done)return Promise.resolve(r.value);
@@ -705,7 +752,7 @@ for(var k in consts){cp[k]=consts[k];}
 // Lock it down so reference implementation's real loader (which may arrive via an absolute
 // URL bypassing the bridge) cannot replace our emulation with its
 // extension-dependent `pluginObject` (undefined here).
-try{Object.defineProperty(window,'cadesplugin',{value:cp,writable:false,configurable:false,enumerable:true});}catch(e){try{window.cadesplugin=cp;}catch(_){}}
+try{Object.defineProperty(window,'cadesplugin',{value:cp,writable:true,configurable:true,enumerable:true});}catch(e){try{window.cadesplugin=cp;}catch(_){}}
 try{window.cadesplugin_load_error=false;}catch(e){}
 // Legacy/NPAPI load handshake: some ФНС pages (e.g. НБО's `bfd` watchdog) post
 // `cadesplugin_echo_request` and wait for `cadesplugin_loaded`, otherwise timing
@@ -879,7 +926,14 @@ mod tests {
             Content-Length: 0\r\n\
             \r\n";
         let mut jar = CookieJar::new();
-        let out = rewrite_response(raw, "http://127.0.0.1:18888", false, &mut jar);
+        let out = rewrite_response(
+            raw,
+            "http://127.0.0.1:18888",
+            "lkulgost.nalog.ru",
+            "lkulgost.nalog.ru",
+            false,
+            &mut jar,
+        );
         let text = String::from_utf8(out).unwrap();
         assert!(
             text.contains("Location: http://127.0.0.1:18888/__up/lkulgost.nalog.ru/v2/auth\r\n")
@@ -893,7 +947,14 @@ mod tests {
     fn rewrite_preserves_body() {
         let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
         let mut jar = CookieJar::new();
-        let out = rewrite_response(raw, "http://127.0.0.1:1", false, &mut jar);
+        let out = rewrite_response(
+            raw,
+            "http://127.0.0.1:1",
+            "lkulgost.nalog.ru",
+            "lkulgost.nalog.ru",
+            false,
+            &mut jar,
+        );
         let text = String::from_utf8(out).unwrap();
         assert!(text.ends_with("\r\n\r\nhello"));
     }

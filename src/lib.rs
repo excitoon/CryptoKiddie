@@ -3736,18 +3736,27 @@ impl CcidApduCommand {
         while let Some(arg) = iter.next() {
             match arg.to_string_lossy().as_ref() {
                 "--ccid-reader" => {
-                    ccid_reader =
-                        Some(next_value(&mut iter, "--ccid-reader")?.to_string_lossy().into())
+                    ccid_reader = Some(
+                        next_value(&mut iter, "--ccid-reader")?
+                            .to_string_lossy()
+                            .into(),
+                    )
                 }
                 "--exchange-log" => {
                     exchange_log = Some(PathBuf::from(next_value(&mut iter, "--exchange-log")?))
                 }
                 "--pin-env" => {
-                    pin_env = Some(next_value(&mut iter, "--pin-env")?.to_string_lossy().into_owned())
+                    pin_env = Some(
+                        next_value(&mut iter, "--pin-env")?
+                            .to_string_lossy()
+                            .into_owned(),
+                    )
                 }
-                "--apdu" => {
-                    apdus.push(next_value(&mut iter, "--apdu")?.to_string_lossy().into_owned())
-                }
+                "--apdu" => apdus.push(
+                    next_value(&mut iter, "--apdu")?
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
                 other => return Err(CliError::Usage(format!("unknown option: {other}"))),
             }
         }
@@ -4347,6 +4356,24 @@ fn route_upstream(target: &str, default_host: &str) -> (String, String) {
     }
 }
 
+/// If `referer` points at a page proxied under `/__up/<host>/…`, return the
+/// `/__up/<host>` prefix so a root-relative sibling request (`/static/…`,
+/// `/api/…`, a runtime-injected `async_code.js`) can inherit that host instead
+/// of defaulting to the primary GOST front. Returns `None` for primary-host
+/// pages (no `/__up/` in the Referer — e.g. the login SPA at `/v2/auth`), so
+/// their root-relative assets keep routing to the default host unchanged.
+fn referer_upstream_prefix(referer: Option<&str>) -> Option<String> {
+    let r = referer?;
+    let idx = r.find("/__up/")?;
+    let rest = &r[idx + "/__up/".len()..];
+    let slash = rest.find('/').unwrap_or(rest.len());
+    let host = &rest[..slash];
+    if host.is_empty() || !(host == "nalog.ru" || host.ends_with(".nalog.ru")) {
+        return None;
+    }
+    Some(format!("/__up/{host}"))
+}
+
 /// Only ФНС hosts may be proxied, so the universal `/__up/` router cannot be
 /// turned into an open relay to arbitrary infrastructure.
 fn host_allowed(host: &str) -> bool {
@@ -4364,7 +4391,10 @@ fn host_allowed(host: &str) -> bool {
 /// plain suffix test would misroute it to plain TLS and the handshake would fail.
 fn is_gost_front(host: &str) -> bool {
     let h = host.split(':').next().unwrap_or(host);
-    h.ends_with(".nalog.ru") && h.split('.').next().is_some_and(|label| label.contains("gost"))
+    h.ends_with(".nalog.ru")
+        && h.split('.')
+            .next()
+            .is_some_and(|label| label.contains("gost"))
 }
 
 /// Load a client certificate chain from `path`, leaf first.
@@ -4393,11 +4423,17 @@ fn load_client_cert_chain(path: &std::path::Path) -> Result<Vec<Vec<u8>>, CliErr
     while let Some(start) = rest.find(BEGIN) {
         let after = &rest[start + BEGIN.len()..];
         let Some(end) = after.find(END) else { break };
-        let b64: String = after[..end].chars().filter(|c| !c.is_whitespace()).collect();
+        let b64: String = after[..end]
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
         let der = base64::engine::general_purpose::STANDARD
             .decode(b64.as_bytes())
             .map_err(|e| {
-                CliError::Message(format!("client cert {}: bad base64 in PEM: {e}", path.display()))
+                CliError::Message(format!(
+                    "client cert {}: bad base64 in PEM: {e}",
+                    path.display()
+                ))
             })?;
         chain.push(der);
         rest = &after[end + END.len()..];
@@ -5095,6 +5131,19 @@ impl GostBridgeCommand {
             // sibling host (`mf-lk.nalog.ru`); `rewrite_response` rewrites their
             // absolute URLs into the `/__up/` form, funnelling the whole cabinet
             // through this one bridge with no per-host code.
+            // Root-relative requests (`/static/…`, `/api/…`) carry no host and
+            // default to the primary GOST front. When they originate from a page
+            // we proxied under `/__up/<host>/` (per Referer), they belong to THAT
+            // host — a gosreg page's runtime-injected scripts (`async_code.js`)
+            // and AJAX are root-relative and otherwise 302 to the primary front,
+            // so its cryptoapi never builds. Inherit the host from the Referer.
+            let target = if target.starts_with("/__up/") || target.starts_with("/__bridge/") {
+                target
+            } else if let Some(prefix) = referer_upstream_prefix(req.header("referer")) {
+                format!("{prefix}{target}")
+            } else {
+                target
+            };
             let (upstream_host, origin_path) = route_upstream(&target, &self.host);
             if upstream_host != self.host && !host_allowed(&upstream_host) {
                 eprintln!("gost-bridge: refusing non-nalog.ru host {upstream_host}");
@@ -5163,7 +5212,14 @@ impl GostBridgeCommand {
             // model (no browser extension); `SignCades` POSTs to `/__bridge/sign`
             // and the token returns a real CMS. Set `CK_NO_SHIM` to disable.
             let inject_shim = std::env::var_os("CK_NO_SHIM").is_none();
-            let rewritten = rewrite_response(&response, &bridge_origin, inject_shim, &mut jar);
+            let rewritten = rewrite_response(
+                &response,
+                &bridge_origin,
+                &upstream_host,
+                &self.host,
+                inject_shim,
+                &mut jar,
+            );
             if let Err(e) = stream.write_all(&rewritten) {
                 eprintln!("gost-bridge: write to browser failed: {e}");
             }
